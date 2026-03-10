@@ -393,65 +393,135 @@ class StrategyEngine:
     def __init__(self, config: BotConfig):
         self.config = config
 
-    def should_enter(self, match: Match, available_usdc: float) -> tuple[bool, str, float]:
+        # Edge thresholds
+        self.min_edge = 0.05
+        self.max_edge = 0.25
+
+    def model_probability(self, match: Match) -> dict:
         """
-        Returns (should_buy, outcome, confidence_score)
-        outcome: "home" | "draw" | "away"
+        Modelo simples baseado nas odds das casas.
+        Converte odds em probabilidade normalizada.
         """
+
+        home = match.home_odds
+        draw = match.draw_odds
+        away = match.away_odds
+
+        total = home + draw + away
+
+        if total <= 0:
+            return {"home": 0.33, "draw": 0.33, "away": 0.33}
+
+        return {
+            "home": home / total,
+            "draw": draw / total,
+            "away": away / total
+        }
+
+    def calculate_edge(self, model_prob: float, market_price: float) -> float:
+        """
+        EDGE = probabilidade modelo - preço do mercado
+        """
+        return model_prob - market_price
+
+    def should_enter(self, match: Match, available_usdc: float):
+
         now = datetime.utcnow()
 
-        # Check if match is in time window (1h to 48h before start)
         hours_until = (match.start_time.replace(tzinfo=None) - now).total_seconds() / 3600
+
         if hours_until < self.config.min_hours_before_game:
             return False, "", 0
+
         if hours_until > self.config.max_hours_before_game:
             return False, "", 0
 
-        # Check we have capital
-        position_size = min(
-            self.config.max_position_usdc,
-            available_usdc * self.config.bankroll_risk_pct
-        )
-        if position_size < 5:  # Minimum $5 bet
-            return False, "", 0
+        model_probs = self.model_probability(match)
 
-        # Find best value outcome
+        best_edge = 0
         best_outcome = ""
-        best_score = 0
 
-        candidates = [
-            ("home", match.home_odds, match.home_team),
-            ("away", match.away_odds, match.away_team),
+        outcomes = [
+            ("home", match.home_odds, match.home_win_token_id),
+            ("away", match.away_odds, match.away_win_token_id),
         ]
 
-        for outcome, prob, team in candidates:
-            if self.config.min_odds <= prob <= self.config.max_odds:
-                # Simple value score: prefer odds near 0.5 (most liquid, most movement potential)
-                value_score = 1 - abs(prob - 0.45)  # Slight home bias
-                if value_score > best_score:
-                    best_score = value_score
+        for outcome, market_price, token in outcomes:
+
+            if market_price <= 0:
+                continue
+
+            model_prob = model_probs[outcome]
+
+            edge = self.calculate_edge(model_prob, market_price)
+
+            if self.min_edge < edge < self.max_edge:
+
+                if edge > best_edge:
+                    best_edge = edge
                     best_outcome = outcome
 
         if best_outcome:
-            log.info(f"[SIGNAL] Entry signal: {match.home_team} vs {match.away_team} | Bet: {best_outcome} | Score: {best_score:.2f}")
-            return True, best_outcome, best_score
+
+            log.info(
+                f"[EDGE SIGNAL] {match.home_team} vs {match.away_team} | "
+                f"Outcome: {best_outcome} | Edge: {best_edge:.2%}"
+            )
+
+            return True, best_outcome, best_edge
 
         return False, "", 0
 
-    def calculate_position_size(self, available_usdc: float) -> float:
-        """Kelly-inspired position sizing"""
+    def calculate_position_size(self, available_usdc: float):
+
         size = min(
             self.config.max_position_usdc,
             available_usdc * self.config.bankroll_risk_pct
         )
+
         return round(size, 2)
 
-    def should_exit(self, position: Position, match: Match, current_price: float) -> tuple[bool, str]:
-        """
-        Returns (should_sell, reason)
-        Checks: goal events, profit target, stop loss, time
-        """
+    def should_exit(self, position: Position, match: Match, current_price: float):
+
         pnl_pct = (current_price - position.entry_price) / position.entry_price
+
+        # Take profit
+        if pnl_pct >= self.config.profit_target_pct:
+            return True, f"profit_target (+{pnl_pct*100:.1f}%)"
+
+        # Stop loss
+        if pnl_pct <= -self.config.stop_loss_pct:
+            return True, f"stop_loss ({pnl_pct*100:.1f}%)"
+
+        # Time exit
+        if match.minute >= self.config.sell_after_minutes:
+            return True, f"time_stop (min {match.minute})"
+
+        # Goal events
+        if match.status == "live":
+
+            if self.config.sell_on_favorable_goal:
+
+                if position.outcome == "home" and match.home_score > match.away_score:
+                    if pnl_pct > 0.05:
+                        return True, "favorable_goal"
+
+                if position.outcome == "away" and match.away_score > match.home_score:
+                    if pnl_pct > 0.05:
+                        return True, "favorable_goal"
+
+            if self.config.sell_on_adverse_goal:
+
+                if position.outcome == "home" and match.away_score > match.home_score:
+                    return True, "adverse_goal"
+
+                if position.outcome == "away" and match.home_score > match.away_score:
+                    return True, "adverse_goal"
+
+        if match.status == "finished":
+            return True, "match_finished"
+
+        return False, ""
 
         #  PROFIT TARGET 
         if pnl_pct >= self.config.profit_target_pct:
