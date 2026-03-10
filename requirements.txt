@@ -1,0 +1,6 @@
+requests
+python-dotenv
+schedule
+web3
+py-clob-client
+websocket-client
