@@ -1,206 +1,426 @@
 """
 =================================================================
-         POLYMARKET FOOTBALL BOT v2.0 - OTIMIZADO PARA LUCRO
-   Estratégias: Arbitragem + Market Making + Event-Driven + IA leve
-   Atualizado para taxas dinâmicas (Fev/2026)
+    POLYMARKET FOOTBALL BOT v3.0 - CÓDIGO COMPLETO OTIMIZADO
+    Estratégias: Event-Driven + Arbitragem + Gestão Avançada
+    SEM dependências externas complexas (numpy opcional)
 =================================================================
 """
 
 import os
 import json
 import time
+import hmac
+import hashlib
 import logging
 import schedule
 import requests
-import numpy as np
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Tuple, Dict
-from dotenv import load_dotenv
+from typing import Optional, List, Tuple, Dict, Any
 from collections import deque
-
-# WebSocket para latência baixa
-import websocket
 import threading
+from dotenv import load_dotenv
 
+# Tentativa de importar numpy (opcional)
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+    print("[INFO] NumPy não instalado. Usando implementações puras em Python.")
+
+# Tentativa de importar WebSocket (opcional para modo real)
+try:
+    import websocket
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    print("[INFO] WebSocket não instalado. Usando REST polling (mais lento).")
+
+# Tentativa de importar cliente Polymarket (opcional)
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, Side, OrderType
+    from py_clob_client.clob_types import OrderArgs, Side
     from py_clob_client.constants import POLYGON
     CLOB_AVAILABLE = True
 except ImportError:
     CLOB_AVAILABLE = False
-    print("[WARNING] py-clob-client not installed. Running in SIMULATION mode.")
+    print("[INFO] py-clob-client não instalado. Modo simulação apenas.")
 
+# Carrega variáveis de ambiente
 load_dotenv()
 
-# ============= CONFIGURAÇÕES AVANÇADAS =============
+# ============= CONFIGURAÇÕES =============
 @dataclass
-class OptimizedConfig:
-    # Gestão de risco
-    max_position_usdc: float = 100.0  # Aumentado para capturar mais oportunidades
-    max_open_positions: int = 10
+class BotConfig:
+    """Configurações principais do bot"""
+    
+    # ===== GESTÃO DE RISCO =====
+    max_position_usdc: float = 100.0
+    max_open_positions: int = 5
     total_bankroll_usdc: float = 1000.0
-    bankroll_risk_pct: float = 0.10  # Aumentado com stop mais rigoroso
+    bankroll_risk_pct: float = 0.05  # 5% do bankroll por aposta
+    daily_loss_limit: float = 200.0   # Para stop diário
+    weekly_loss_limit: float = 500.0  # Para stop semanal
     
-    # Filtros de entrada
-    min_edge_pct: float = 0.02  # 2% mínimo de edge (antes era 3%)
-    max_edge_pct: float = 0.30  # 30% máximo (evita odds absurdas)
+    # ===== FILTROS DE ENTRADA =====
+    min_edge_pct: float = 0.02        # 2% mínimo de vantagem
+    max_edge_pct: float = 0.30        # 30% máximo (evita odds absurdas)
+    min_hours_before_game: float = 1.0
+    max_hours_before_game: float = 48.0
+    min_odds: float = 0.15            # Mínimo 15% de chance
+    max_odds: float = 0.85            # Máximo 85% de chance
     
-    # Estratégias de saída MULTI-CAMADA
-    profit_targets: List[float] = field(default_factory=lambda: [0.15, 0.30, 0.50, 1.0])
-    stop_losses: List[float] = field(default_factory=lambda: [0.10, 0.25, 0.40])
-    trailing_stop_pct: float = 0.15  # Ativa após 20% de lucro
-    scale_out_pcts: List[float] = field(default_factory=lambda: [0.3, 0.3, 0.4])  # Sai em etapas
+    # ===== ESTRATÉGIA DE SAÍDA =====
+    profit_targets: List[float] = field(default_factory=lambda: [0.20, 0.40, 0.60])
+    stop_losses: List[float] = field(default_factory=lambda: [0.15, 0.30])
+    trailing_stop_pct: float = 0.15
+    scale_out_pcts: List[float] = field(default_factory=lambda: [0.3, 0.3, 0.4])
+    max_hold_minutes: int = 90         # Tempo máximo em jogo
     
-    # ARBITRAGEM (NOVO)
+    # ===== ARBITRAGEM =====
     enable_arbitrage: bool = True
-    min_arb_spread: float = 0.02  # 2% mínimo para arbitragem
-    arb_max_capital: float = 200.0  # Capital dedicado à arbitragem
+    min_arb_spread: float = 0.02       # 2% mínimo
+    arb_max_capital: float = 200.0     # Capital para arbitragem
+    arb_min_volume: float = 1000.0     # Volume mínimo em USDC
     
-    # MARKET MAKING (NOVO)
-    enable_market_making: bool = True
-    mm_spread_bps: int = 20  # 0.2% de spread
-    mm_order_size: float = 25.0  # Tamanho das ordens
-    mm_rebalance_seconds: int = 30
-    
-    # PREÇOS E TAXAS
+    # ===== CONFIGURAÇÕES TÉCNICAS =====
     host: str = "https://clob.polymarket.com"
-    chain_id: int = POLYGON if CLOB_AVAILABLE else 137
-    simulation_mode: bool = True
+    chain_id: int = 137  # Polygon mainnet
+    simulation_mode: bool = True       # Começar em simulação sempre!
+    use_websocket: bool = WEBSOCKET_AVAILABLE
     
-    # APIs
+    # ===== APIS =====
     odds_api_key: str = field(default_factory=lambda: os.getenv("ODDS_API_KEY", ""))
     sportradar_key: str = field(default_factory=lambda: os.getenv("SPORTRADAR_API_KEY", ""))
     telegram_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
+    
+    # ===== WALLET =====
+    private_key: str = field(default_factory=lambda: os.getenv("POLYMARKET_PRIVATE_KEY", ""))
+    wallet_address: str = field(default_factory=lambda: os.getenv("POLYMARKET_WALLET_ADDRESS", ""))
 
-CONFIG = OptimizedConfig()
+# Instância global de configuração
+CONFIG = BotConfig()
 
-# ============= CLIENTE OTIMIZADO COM WEBSOCKET =============
-class OptimizedPolymarketClient:
-    def __init__(self, config: OptimizedConfig):
+# ============= UTILITÁRIOS =============
+class MovingAverage:
+    """Média móvel simples sem numpy"""
+    def __init__(self, window: int = 10):
+        self.window = window
+        self.values = deque(maxlen=window)
+    
+    def add(self, value: float):
+        self.values.append(value)
+    
+    def mean(self) -> float:
+        if not self.values:
+            return 0.0
+        return sum(self.values) / len(self.values)
+    
+    def std(self) -> float:
+        """Desvio padrão amostral"""
+        if len(self.values) < 2:
+            return 0.0
+        mean = self.mean()
+        variance = sum((x - mean) ** 2 for x in self.values) / (len(self.values) - 1)
+        return variance ** 0.5
+
+def safe_float_division(a: float, b: float, default: float = 0.0) -> float:
+    """Divisão segura evitando divisão por zero"""
+    if b == 0 or abs(b) < 1e-10:
+        return default
+    return a / b
+
+def format_currency(value: float) -> str:
+    """Formata valor em dólar"""
+    return f"${value:,.2f}"
+
+def format_percent(value: float) -> str:
+    """Formata percentual"""
+    return f"{value*100:.1f}%"
+
+# ============= LOGGING E TELEGRAM =============
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger("PolyBot")
+
+def send_telegram(message: str):
+    """Envia mensagem para Telegram"""
+    if not CONFIG.telegram_token or not CONFIG.telegram_chat_id:
+        return
+    
+    try:
+        url = f"https://api.telegram.org/bot{CONFIG.telegram_token}/sendMessage"
+        payload = {
+            "chat_id": CONFIG.telegram_chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        log.debug(f"Erro Telegram: {e}")
+
+# ============= MODELOS DE DADOS =============
+@dataclass
+class Match:
+    """Representa uma partida de futebol"""
+    match_id: str
+    home_team: str
+    away_team: str
+    start_time: datetime
+    league: str
+    condition_id: str = ""
+    token_ids: Dict[str, str] = field(default_factory=dict)
+    
+    # Odds
+    home_odds: float = 0.0
+    draw_odds: float = 0.0
+    away_odds: float = 0.0
+    
+    # Live data
+    minute: int = 0
+    home_score: int = 0
+    away_score: int = 0
+    status: str = "scheduled"  # scheduled, live, finished
+    
+    def __post_init__(self):
+        if isinstance(self.start_time, str):
+            self.start_time = datetime.fromisoformat(self.start_time.replace('Z', '+00:00'))
+    
+    @property
+    def total_odds(self) -> float:
+        return self.home_odds + self.draw_odds + self.away_odds
+    
+    @property
+    def normalized_probs(self) -> Dict[str, float]:
+        """Probabilidades normalizadas (somam 1)"""
+        total = self.total_odds
+        if total <= 0:
+            return {"home": 0.33, "draw": 0.34, "away": 0.33}
+        return {
+            "home": self.home_odds / total,
+            "draw": self.draw_odds / total,
+            "away": self.away_odds / total
+        }
+    
+    @property
+    def time_until(self) -> float:
+        """Horas até o jogo começar"""
+        now = datetime.utcnow()
+        start = self.start_time.replace(tzinfo=None)
+        return (start - now).total_seconds() / 3600
+    
+    @property
+    def is_live(self) -> bool:
+        return self.status == "live"
+    
+    @property
+    def is_finished(self) -> bool:
+        return self.status == "finished"
+    
+    def __str__(self) -> str:
+        return f"{self.home_team} vs {self.away_team} ({self.league})"
+
+@dataclass
+class Position:
+    """Representa uma posição aberta"""
+    position_id: str
+    match: Match
+    outcome: str  # home, draw, away
+    token_id: str
+    entry_price: float
+    size_usdc: float
+    shares: float
+    entry_time: datetime
+    status: str = "open"
+    exit_price: float = 0.0
+    pnl_usdc: float = 0.0
+    pnl_percent: float = 0.0
+    sell_reason: str = ""
+    
+    # Para trailing stop
+    highest_price: float = 0.0
+    
+    def __post_init__(self):
+        if isinstance(self.entry_time, str):
+            self.entry_time = datetime.fromisoformat(self.entry_time)
+        self.highest_price = self.entry_price
+    
+    @property
+    def current_pnl_percent(self, current_price: float) -> float:
+        """Calcula PnL percentual atual"""
+        if self.entry_price == 0:
+            return 0.0
+        return (current_price - self.entry_price) / self.entry_price
+    
+    @property
+    def holding_minutes(self) -> float:
+        """Minutos desde a entrada"""
+        delta = datetime.utcnow() - self.entry_time
+        return delta.total_seconds() / 60
+
+# ============= CLIENTE POLYMARKET =============
+class PolymarketClient:
+    """Cliente para API da Polymarket"""
+    
+    def __init__(self, config: BotConfig):
         self.config = config
-        self.client = None
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "PolyBot/3.0"
+        })
+        
+        # Modo simulação
         self.simulation_mode = config.simulation_mode
-        self.ws_connections = {}
-        self.orderbooks = {}  # Cache do book
-        self.fee_rates = {}   # Cache de taxas (expira em 5s)
+        
+        # Cache
+        self.price_cache = {}
+        self.fee_cache = {}
         self.last_fee_update = {}
         
+        # WebSocket (se disponível)
+        self.ws = None
+        self.ws_thread = None
+        self.ws_running = False
+        self.orderbooks = {}
+        
+        # Cliente oficial (se disponível)
+        self.clob_client = None
         if not self.simulation_mode and CLOB_AVAILABLE:
-            self._init_real_client()
-            
-        # Thread para WebSocket
-        self.ws_thread = threading.Thread(target=self._ws_loop, daemon=True)
-        self.ws_running = True
-        self.ws_thread.start()
+            self._init_clob_client()
+        
+        log.info(f"[CLIENT] Inicializado. Modo: {'SIMULAÇÃO' if self.simulation_mode else 'REAL'}")
     
-    def _init_real_client(self):
-        """Inicializa cliente com suporte a taxas dinâmicas"""
+    def _init_clob_client(self):
+        """Inicializa cliente CLOB oficial"""
         try:
-            self.client = ClobClient(
+            self.clob_client = ClobClient(
                 host=self.config.host,
                 chain_id=self.config.chain_id,
-                key=os.getenv("POLYMARKET_PRIVATE_KEY"),
+                key=self.config.private_key,
                 signature_type=2,
-                funder=os.getenv("POLYMARKET_WALLET_ADDRESS")
+                funder=self.config.wallet_address
             )
-            self.client.set_api_creds(self.client.create_or_derive_api_creds())
-            log.info("[OK] Cliente Polymarket inicializado")
+            creds = self.clob_client.create_or_derive_api_creds()
+            self.clob_client.set_api_creds(creds)
+            log.info("[OK] Cliente CLOB inicializado")
         except Exception as e:
-            log.error(f"Falha ao inicializar: {e}")
+            log.error(f"Erro ao inicializar CLOB: {e}")
             self.simulation_mode = True
     
     def _get_fee_rate(self, token_id: str, side: str) -> int:
-        """CONSULTA TAXA DINÂMICA (obrigatório pós-fev/2026)"""
+        """Obtém taxa atual (crítico pós-fev/2026)"""
+        if self.simulation_mode:
+            return 0
+        
         cache_key = f"{token_id}_{side}"
         
-        # Cache por 5 segundos apenas
-        if cache_key in self.fee_rates:
+        # Cache por 5 segundos
+        if cache_key in self.fee_cache:
             age = time.time() - self.last_fee_update.get(cache_key, 0)
             if age < 5:
-                return self.fee_rates[cache_key]
+                return self.fee_cache[cache_key]
         
         try:
-            # Endpoint oficial de taxas
             url = f"{self.config.host}/fee-rate"
-            resp = requests.get(url, params={
+            resp = self.session.get(url, params={
                 "token_id": token_id,
                 "side": side
-            }, timeout=2).json()
+            }, timeout=3).json()
             
             fee = int(resp.get("fee_rate_bps", 0))
-            self.fee_rates[cache_key] = fee
+            self.fee_cache[cache_key] = fee
             self.last_fee_update[cache_key] = time.time()
             return fee
-        except:
-            return 0  # Fallback seguro
+        except Exception as e:
+            log.debug(f"Erro ao consultar taxa: {e}")
+            return 0
     
-    def _ws_loop(self):
-        """Loop principal do WebSocket para múltiplos mercados"""
-        while self.ws_running:
-            try:
-                ws = websocket.WebSocketApp(
-                    "wss://clob.polymarket.com/ws",
-                    on_message=self._on_ws_message,
-                    on_error=self._on_ws_error
-                )
-                ws.run_forever()
-            except:
-                time.sleep(5)
-    
-    def _on_ws_message(self, ws, message):
-        """Processa atualizações em tempo real do book"""
-        try:
-            data = json.loads(message)
-            if data.get("type") == "book":
-                token_id = data.get("asset_id")
-                self.orderbooks[token_id] = {
-                    "bids": data.get("bids", []),
-                    "asks": data.get("asks", []),
-                    "timestamp": time.time()
-                }
-        except:
-            pass
-    
-    def subscribe_market(self, token_id: str):
-        """Inscreve para receber updates em tempo real"""
-        if self.simulation_mode:
-            return
-        # Envia comando de subscription via WebSocket
-        # Implementação depende da API específica
-    
-    def get_best_prices(self, token_id: str) -> Tuple[float, float]:
-        """Retorna melhor bid/ask com cache do WebSocket"""
+    def get_order_book(self, token_id: str) -> Dict[str, Any]:
+        """Obtém book de ordens"""
         # Tenta cache do WebSocket primeiro
         if token_id in self.orderbooks:
             book = self.orderbooks[token_id]
             age = time.time() - book.get("timestamp", 0)
             if age < 2:  # Cache válido por 2s
-                best_bid = float(book["bids"][0]["price"]) if book.get("bids") else 0
-                best_ask = float(book["asks"][0]["price"]) if book.get("asks") else 1
-                return best_bid, best_ask
+                return book
         
         # Fallback para REST
         try:
             url = f"{self.config.host}/book"
-            resp = requests.get(url, params={"token_id": token_id}, timeout=2).json()
-            best_bid = float(resp["bids"][0]["price"]) if resp.get("bids") else 0
-            best_ask = float(resp["asks"][0]["price"]) if resp.get("asks") else 1
-            return best_bid, best_ask
-        except:
-            return 0.0, 1.0
+            resp = self.session.get(url, params={"token_id": token_id}, timeout=3).json()
+            
+            book = {
+                "bids": [(float(b["price"]), float(b["size"])) for b in resp.get("bids", [])],
+                "asks": [(float(a["price"]), float(a["size"])) for a in resp.get("asks", [])],
+                "timestamp": time.time()
+            }
+            
+            # Atualiza cache
+            self.orderbooks[token_id] = book
+            return book
+        except Exception as e:
+            log.debug(f"Erro ao obter book: {e}")
+            return {"bids": [], "asks": [], "timestamp": time.time()}
     
-    def place_smart_order(self, token_id: str, size_usdc: float, side: str, 
-                          order_type: str = "market") -> Dict:
+    def get_mid_price(self, token_id: str) -> float:
+        """Obtém preço médio (bid+ask)/2"""
+        book = self.get_order_book(token_id)
+        
+        best_bid = book["bids"][0][0] if book["bids"] else 0.0
+        best_ask = book["asks"][0][0] if book["asks"] else 1.0
+        
+        if best_bid == 0 and best_ask == 1.0:
+            return 0.5
+        if best_bid == 0:
+            return best_ask * 0.95
+        if best_ask == 1.0:
+            return best_bid * 1.05
+        
+        return (best_bid + best_ask) / 2
+    
+    def get_best_prices(self, token_id: str) -> Tuple[float, float]:
+        """Retorna melhor bid e ask"""
+        book = self.get_order_book(token_id)
+        
+        best_bid = book["bids"][0][0] if book["bids"] else 0.0
+        best_ask = book["asks"][0][0] if book["asks"] else 1.0
+        
+        return best_bid, best_ask
+    
+    def place_order(self, token_id: str, size_usdc: float, side: str, 
+                   order_type: str = "market") -> Dict[str, Any]:
         """
-        Coloca ordem com ciência das taxas
+        Coloca uma ordem na Polymarket
+        side: "buy" ou "sell"
         order_type: "market" (taker) ou "limit" (maker)
         """
         if self.simulation_mode:
-            log.info(f"[SIM] {side.upper()} ${size_usdc} @ {order_type}")
-            return {"success": True, "order_id": f"SIM-{int(time.time())}"}
+            bid, ask = self.get_best_prices(token_id)
+            price = ask if side == "buy" else bid
+            shares = size_usdc / price
+            
+            log.info(f"[SIM] {side.upper()} {size_usdc:.2f} USDC @ {price:.4f} "
+                    f"({order_type}) | Shares: {shares:.2f}")
+            
+            return {
+                "success": True,
+                "order_id": f"SIM-{int(time.time())}",
+                "price": price,
+                "shares": shares,
+                "simulated": True
+            }
+        
+        if not self.clob_client:
+            log.error("Cliente CLOB não disponível")
+            return {"success": False, "error": "CLOB not available"}
         
         try:
             # 1. Consulta taxa atual
@@ -222,309 +442,404 @@ class OptimizedPolymarketClient:
             
             shares = size_usdc / price
             
-            # 3. Cria ordem com fee incluso na assinatura
+            # 3. Cria ordem com fee incluso
             order_args = OrderArgs(
                 price=price,
                 size=shares,
                 side=Side.BUY if side == "buy" else Side.SELL,
                 token_id=token_id,
-                fee_rate_bps=fee_rate  # CRÍTICO!
+                fee_rate_bps=fee_rate
             )
             
-            resp = self.client.create_and_post_order(order_args)
-            return {"success": True, "order_id": resp.get("orderID")}
+            resp = self.clob_client.create_and_post_order(order_args)
+            
+            log.info(f"[ORDER] {side.upper()} {size_usdc:.2f} USDC @ {price:.4f} | "
+                    f"Fee: {fee_rate}bps")
+            
+            return {
+                "success": True,
+                "order_id": resp.get("orderID"),
+                "price": price,
+                "shares": shares
+            }
             
         except Exception as e:
             log.error(f"Erro na ordem: {e}")
             return {"success": False, "error": str(e)}
+    
+    def get_balance(self) -> float:
+        """Obtém saldo em USDC"""
+        if self.simulation_mode:
+            return self.config.total_bankroll_usdc
+        
+        try:
+            if self.clob_client:
+                return float(self.clob_client.get_balance())
+        except Exception as e:
+            log.debug(f"Erro ao obter saldo: {e}")
+        
+        return 0.0
+
+# ============= CLIENTE DE DADOS DE FUTEBOL =============
+class FootballDataClient:
+    """Cliente para dados de futebol"""
+    
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self.cache = {}
+        self.last_update = {}
+    
+    def get_upcoming_matches(self) -> List[Match]:
+        """Obtém próximas partidas"""
+        
+        # Se não tem API key, retorna dados simulados
+        if not self.config.odds_api_key:
+            return self._get_mock_matches()
+        
+        try:
+            leagues = [
+                "soccer_epl",
+                "soccer_spain_la_liga",
+                "soccer_italy_serie_a",
+                "soccer_germany_bundesliga",
+                "soccer_france_ligue_one",
+                "soccer_brazil_campeonato",
+                "soccer_uefa_champs_league"
+            ]
+            
+            all_matches = []
+            
+            for league in leagues:
+                params = {
+                    "apiKey": self.config.odds_api_key,
+                    "regions": "eu,us",
+                    "markets": "h2h",
+                    "oddsFormat": "decimal",
+                    "dateFormat": "iso"
+                }
+                
+                url = f"https://api.the-odds-api.com/v4/sports/{league}/odds/"
+                resp = requests.get(url, params=params, timeout=10)
+                
+                if resp.status_code != 200:
+                    continue
+                
+                for game in resp.json():
+                    match = self._parse_odds_game(game)
+                    if match:
+                        all_matches.append(match)
+            
+            log.info(f"[ODDS] Encontradas {len(all_matches)} partidas")
+            return all_matches
+            
+        except Exception as e:
+            log.error(f"Erro ao buscar odds: {e}")
+            return self._get_mock_matches()
+    
+    def _parse_odds_game(self, game: Dict) -> Optional[Match]:
+        """Converte resposta da API para objeto Match"""
+        try:
+            # Data de início
+            start_time = datetime.fromisoformat(
+                game["commence_time"].replace("Z", "+00:00")
+            )
+            
+            # Bookmakers
+            bookmakers = game.get("bookmakers", [])
+            if not bookmakers:
+                return None
+            
+            # Pega o primeiro bookmaker com odds
+            for bk in bookmakers:
+                markets = bk.get("markets", [])
+                if not markets:
+                    continue
+                
+                outcomes = markets[0].get("outcomes", [])
+                if not outcomes:
+                    continue
+                
+                # Mapeia odds
+                odds_map = {o["name"]: 1.0 / o["price"] for o in outcomes}
+                
+                home_team = game["home_team"]
+                away_team = game["away_team"]
+                
+                return Match(
+                    match_id=game["id"],
+                    home_team=home_team,
+                    away_team=away_team,
+                    start_time=start_time,
+                    league=game.get("sport_title", "Football"),
+                    home_odds=odds_map.get(home_team, 0.4),
+                    draw_odds=odds_map.get("Draw", 0.3),
+                    away_odds=odds_map.get(away_team, 0.3)
+                )
+            
+            return None
+            
+        except Exception as e:
+            log.debug(f"Erro ao parsear jogo: {e}")
+            return None
+    
+    def get_live_score(self, match: Match) -> Tuple[int, int, int, str]:
+        """Obtém placar ao vivo"""
+        
+        # Se não tem API key, retorna simulado
+        if not self.config.sportradar_key:
+            return self._mock_live_score(match)
+        
+        try:
+            # Exemplo com Sportradar (ajuste conforme sua API)
+            url = f"https://api.sportradar.com/soccer/trial/v4/en/matches/{match.match_id}/timeline.json"
+            resp = requests.get(url, params={"api_key": self.config.sportradar_key}, timeout=5)
+            
+            data = resp.json()
+            status = data.get("sport_event_status", {})
+            
+            minute = status.get("match_time", 0)
+            home = status.get("home_score", 0)
+            away = status.get("away_score", 0)
+            status_str = status.get("status", "live")
+            
+            return minute, home, away, status_str
+            
+        except Exception as e:
+            log.debug(f"Erro ao buscar placar: {e}")
+            return self._mock_live_score(match)
+    
+    def _get_mock_matches(self) -> List[Match]:
+        """Gera partidas simuladas para teste"""
+        now = datetime.utcnow()
+        
+        return [
+            Match(
+                match_id=f"mock_{i}",
+                home_team=f"Time {chr(65+i)}",
+                away_team=f"Time {chr(75+i)}",
+                start_time=now + timedelta(hours=3*(i+1)),
+                league="Liga Mock",
+                home_odds=0.35 + (i*0.02),
+                draw_odds=0.30,
+                away_odds=0.35 - (i*0.02)
+            )
+            for i in range(5)
+        ]
+    
+    def _mock_live_score(self, match: Match) -> Tuple[int, int, int, str]:
+        """Simula placar ao vivo"""
+        elapsed = (datetime.utcnow() - match.start_time.replace(tzinfo=None)).total_seconds() / 60
+        minute = max(0, min(95, int(elapsed)))
+        
+        if minute < 1:
+            return 0, 0, 0, "not_started"
+        elif minute >= 90:
+            return 90, 2, 1, "finished"
+        
+        # Simula alguns gols
+        home_score = 1 if minute > 30 else 0
+        away_score = 1 if minute > 60 else 0
+        
+        return minute, home_score, away_score, "live"
 
 # ============= ESTRATÉGIA DE ARBITRAGEM =============
 class ArbitrageEngine:
-    """Detecta e executa arbitragem entre mercados relacionados"""
+    """Detecta oportunidades de arbitragem"""
     
-    def __init__(self, client: OptimizedPolymarketClient, config: OptimizedConfig):
+    def __init__(self, client: PolymarketClient, config: BotConfig):
         self.client = client
         self.config = config
-        self.related_markets = {}  # Mapeia mercados relacionados
+        self.opportunities_found = 0
+        self.arb_pnl = 0.0
     
-    def scan_arbitrage(self) -> List[Dict]:
-        """Procura oportunidades de arbitragem"""
+    def scan_markets(self, matches: List[Match]) -> List[Dict]:
+        """Escaneia mercados por oportunidades de arbitragem"""
         opportunities = []
         
-        # Exemplo: Mercados "Time A vence" e "Time A não perde" (vitória ou empate)
-        # A lógica real exigiria mapeamento dos mercados da Polymarket
-        
-        for market_pair in self._get_market_pairs():
-            token1, token2 = market_pair["token1"], market_pair["token2"]
+        for match in matches:
+            # Pula jogos sem odds
+            if match.total_odds <= 0:
+                continue
             
-            # Obtém preços
-            bid1, ask1 = self.client.get_best_prices(token1)
-            bid2, ask2 = self.client.get_best_prices(token2)
+            # Arbitragem 1: YES + NO < 1
+            # Precisa dos token_ids reais aqui
+            # Este é um exemplo conceitual
             
-            # Verifica arbitragem: preço de 1 + preço de 2 < 1
-            if ask1 + ask2 < 0.98:  # 2% de desconto
-                size = min(self.config.arb_max_capital / 2, 100)
-                opp = {
-                    "type": "sum_lt_1",
-                    "token1": token1,
-                    "token2": token2,
-                    "price1": ask1,
-                    "price2": ask2,
-                    "total": ask1 + ask2,
-                    "size": size,
-                    "expected_profit": size * (1 - (ask1 + ask2))
-                }
-                opportunities.append(opp)
-            
-            # Verifica arbitragem de spread entre mercados similares
-            if bid1 - ask2 > self.config.min_arb_spread:
-                opp = {
-                    "type": "cross_market",
-                    "buy_token": token2,
-                    "sell_token": token1,
-                    "buy_price": ask2,
-                    "sell_price": bid1,
-                    "spread": bid1 - ask2,
-                    "size": min(self.config.arb_max_capital, 50)
-                }
-                opportunities.append(opp)
+            # Exemplo: Se home_odds + (1-home_odds) < 0.98
+            if match.home_odds > 0 and match.home_odds < 0.5:
+                # Simula oportunidade de arbitragem
+                total = match.home_odds + (1 - match.home_odds)
+                if total < 0.98:  # 2% de desconto
+                    size = min(
+                        self.config.arb_max_capital,
+                        self.config.total_bankroll_usdc * 0.1
+                    )
+                    
+                    opp = {
+                        "type": "yes_no_arb",
+                        "match": match,
+                        "outcome": "home",
+                        "buy_price": match.home_odds,
+                        "sell_price": 1 - match.home_odds,
+                        "spread": 1 - total,
+                        "size": size,
+                        "expected_profit": size * (1 - total)
+                    }
+                    opportunities.append(opp)
         
         return opportunities
     
     def execute_arbitrage(self, opportunity: Dict) -> bool:
-        """Executa oportunidade de arbitragem"""
-        if opportunity["type"] == "sum_lt_1":
-            # Compra ambos os tokens
-            buy1 = self.client.place_smart_order(
-                opportunity["token1"], 
-                opportunity["size"], 
-                "buy", 
-                "market"
-            )
-            buy2 = self.client.place_smart_order(
-                opportunity["token2"],
-                opportunity["size"],
-                "buy",
-                "market"
-            )
-            
-            if buy1["success"] and buy2["success"]:
-                log.info(f"[ARB] Lucro esperado: ${opportunity['expected_profit']:.2f}")
-                return True
+        """Executa uma oportunidade de arbitragem"""
         
-        elif opportunity["type"] == "cross_market":
-            # Compra barato, vende caro
-            buy = self.client.place_smart_order(
-                opportunity["buy_token"],
-                opportunity["size"],
-                "buy",
-                "market"
-            )
-            sell = self.client.place_smart_order(
-                opportunity["sell_token"],
-                opportunity["size"],
-                "sell",
-                "market"
-            )
-            
-            if buy["success"] and sell["success"]:
-                profit = opportunity["size"] * opportunity["spread"]
-                log.info(f"[ARB] Lucro spread: ${profit:.2f}")
-                return True
+        log.info(f"[ARB] Oportunidade: {opportunity['match']} | "
+                f"Spread: {opportunity['spread']*100:.2f}% | "
+                f"Lucro esperado: ${opportunity['expected_profit']:.2f}")
         
+        # Em simulação, registra como sucesso
+        if self.client.simulation_mode:
+            self.opportunities_found += 1
+            self.arb_pnl += opportunity['expected_profit']
+            log.info(f"[ARB] Executada em simulação")
+            return True
+        
+        # Implementação real exigiria token_ids corretos
+        # e execução em duas pernas
+        log.warning("[ARB] Execução real não implementada sem token_ids")
         return False
-    
-    def _get_market_pairs(self):
-        """Retorna pares de mercados relacionados"""
-        # Implementação dependeria de query aos mercados da Polymarket
-        return []
 
-# ============= ESTRATÉGIA DE MARKET MAKING =============
-class MarketMakingEngine:
-    """Provedor de liquidez para capturar spread + recompensas"""
+# ============= ESTRATÉGIA PRINCIPAL =============
+class StrategyEngine:
+    """Motor de estratégia principal"""
     
-    def __init__(self, client: OptimizedPolymarketClient, config: OptimizedConfig):
-        self.client = client
+    def __init__(self, config: BotConfig):
         self.config = config
-        self.active_markets = set()
-        self.orders = {}  # Ordens ativas por mercado
+        self.price_history = {}  # match_id -> {outcome: deque}
+        self.volume_history = {}  # match_id -> deque
     
-    def add_market(self, token_id: str, fair_price: float):
-        """Adiciona mercado para fazer market making"""
-        self.active_markets.add(token_id)
-        self.orders[token_id] = {"bid": None, "ask": None}
+    def _get_price_history(self, match: Match, outcome: str) -> MovingAverage:
+        """Obtém histórico de preços para um mercado"""
+        key = f"{match.match_id}_{outcome}"
+        if key not in self.price_history:
+            self.price_history[key] = MovingAverage(window=10)
+        return self.price_history[key]
     
-    def rebalance(self):
-        """Atualiza ordens de market making"""
-        for token_id in self.active_markets:
-            try:
-                # Obtém preço justo (usando nosso modelo)
-                fair = self._estimate_fair_price(token_id)
-                
-                # Calcula preços com spread
-                spread = self.config.mm_spread_bps / 10000  # bps para decimal
-                bid_price = fair * (1 - spread/2)
-                ask_price = fair * (1 + spread/2)
-                
-                # Cancela ordens existentes
-                self._cancel_orders(token_id)
-                
-                # Coloca novas ordens (sempre MAKER para não pagar taxas)
-                bid_order = self.client.place_smart_order(
-                    token_id,
-                    self.config.mm_order_size,
-                    "buy",
-                    "limit"  # Maker order!
-                )
-                
-                ask_order = self.client.place_smart_order(
-                    token_id,
-                    self.config.mm_order_size,
-                    "sell",
-                    "limit"  # Maker order!
-                )
-                
-                log.debug(f"[MM] {token_id}: Bid ${bid_price:.4f} Ask ${ask_price:.4f}")
-                
-            except Exception as e:
-                log.error(f"Erro MM {token_id}: {e}")
-    
-    def _estimate_fair_price(self, token_id: str) -> float:
-        """Estima preço justo usando múltiplas fontes"""
-        # 1. Preço de mercado (mid)
-        bid, ask = self.client.get_best_prices(token_id)
-        mid = (bid + ask) / 2 if bid > 0 else 0.5
-        
-        # 2. Poderia adicionar modelo probabilístico aqui
-        return mid
-    
-    def _cancel_orders(self, token_id: str):
-        """Cancela ordens ativas"""
-        # Implementar cancelamento via API
-        pass
-
-# ============= ESTRATÉGIA PRINCIPAL OTIMIZADA =============
-class OptimizedStrategy:
-    def __init__(self, config: OptimizedConfig):
-        self.config = config
-        self.price_history = {}  # Para análise de momentum
-        
-    def should_enter(self, match: Match, available_usdc: float) -> Tuple[bool, str, float, float]:
-        """Versão melhorada com múltiplos fatores"""
-        now = datetime.utcnow()
-        hours_until = (match.start_time.replace(tzinfo=None) - now).total_seconds() / 3600
-        
-        # Filtro temporal
-        if not (1 <= hours_until <= 48):
-            return False, "", 0, 0
-        
-        # Calcula probabilidades normalizadas
-        total = match.home_odds + match.draw_odds + match.away_odds
-        if total <= 0:
-            return False, "", 0, 0
-        
-        # Múltiplos modelos
-        probs = {
-            "home": match.home_odds / total,
-            "draw": match.draw_odds / total,
-            "away": match.away_odds / total
-        }
-        
-        # Modelo 1: Odds públicas (TheOddsAPI)
-        # Modelo 2: Moving average de preços (momentum)
-        # Modelo 3: Volume analysis
-        
-        best_opportunity = None
-        best_score = 0
-        
-        for outcome in ["home", "draw", "away"]:
-            market_price = getattr(match, f"{outcome}_odds", 0)
-            if market_price <= 0:
-                continue
-            
-            # Edge básico
-            model_prob = probs[outcome]
-            basic_edge = model_prob - market_price
-            
-            # Fator momentum (se preço está subindo)
-            momentum = self._get_momentum(match, outcome)
-            
-            # Fator volume
-            volume_score = self._get_volume_score(match, outcome)
-            
-            # Score composto
-            score = basic_edge * 0.5 + momentum * 0.3 + volume_score * 0.2
-            
-            if (basic_edge > self.config.min_edge_pct and 
-                basic_edge < self.config.max_edge_pct and
-                score > best_score):
-                
-                best_score = score
-                
-                # Tamanho da posição baseado no score
-                size_multiplier = min(2.0, max(0.5, score / 0.05))
-                position_size = min(
-                    self.config.max_position_usdc,
-                    available_usdc * self.config.bankroll_risk_pct * size_multiplier
-                )
-                
-                best_opportunity = (outcome, basic_edge, position_size)
-        
-        if best_opportunity:
-            outcome, edge, size = best_opportunity
-            log.info(f"[OP] {match.home_team} vs {match.away_team} | {outcome} | "
-                    f"Edge: {edge*100:.1f}% | Size: ${size:.2f}")
-            return True, outcome, edge, size
-        
-        return False, "", 0, 0
-    
-    def _get_momentum(self, match: Match, outcome: str) -> float:
-        """Analisa tendência de preço (0 a 1)"""
-        # Implementar análise de série temporal
-        return 0.5
-    
-    def _get_volume_score(self, match: Match, outcome: str) -> float:
-        """Analisa volume de negociação"""
-        return 0.5
-    
-    def should_exit_advanced(self, position: Position, match: Match, 
-                            current_price: float) -> List[Tuple[float, str]]:
+    def calculate_edge(self, match: Match, outcome: str) -> Tuple[float, float]:
         """
-        Retorna múltiplos sinais de saída com proporções
-        [(percentual_a_sair, motivo), ...]
+        Calcula edge (vantagem) para um resultado
+        Retorna: (edge_percent, confidence_score)
+        """
+        probs = match.normalized_probs
+        market_price = getattr(match, f"{outcome}_odds", 0)
+        
+        if market_price <= 0:
+            return 0.0, 0.0
+        
+        # Edge básico: diferença entre modelo e mercado
+        model_prob = probs.get(outcome, 0.33)
+        basic_edge = model_prob - market_price
+        
+        # Fator de momentum (se preço está subindo)
+        history = self._get_price_history(match, outcome)
+        if len(history.values) >= 3:
+            recent = list(history.values)[-3:]
+            momentum = (recent[-1] - recent[0]) / recent[0] if recent[0] > 0 else 0
+        else:
+            momentum = 0
+        
+        # Fator de confiança baseado em liquidez
+        # Quanto maior o volume, maior a confiança
+        confidence = 0.5 + (momentum * 2)  # Simples por enquanto
+        
+        # Edge ajustado
+        edge = basic_edge * (1 + momentum)
+        
+        return edge, min(1.0, max(0.0, confidence))
+    
+    def should_enter(self, match: Match, current_positions: int) -> Tuple[bool, str, float, float]:
+        """Decide se deve entrar em uma posição"""
+        
+        # Verifica limite de posições
+        if current_positions >= self.config.max_open_positions:
+            return False, "", 0.0, 0.0
+        
+        # Verifica tempo até o jogo
+        hours_until = match.time_until
+        if not (self.config.min_hours_before_game <= hours_until <= self.config.max_hours_before_game):
+            return False, "", 0.0, 0.0
+        
+        # Verifica odds mínimas/máximas
+        if match.home_odds < self.config.min_odds or match.home_odds > self.config.max_odds:
+            if match.draw_odds < self.config.min_odds or match.draw_odds > self.config.max_odds:
+                if match.away_odds < self.config.min_odds or match.away_odds > self.config.max_odds:
+                    return False, "", 0.0, 0.0
+        
+        best_outcome = None
+        best_edge = 0
+        best_confidence = 0
+        
+        # Avalia cada resultado
+        for outcome in ["home", "draw", "away"]:
+            edge, confidence = self.calculate_edge(match, outcome)
+            
+            if edge > self.config.min_edge_pct and edge < self.config.max_edge_pct:
+                if edge > best_edge and confidence > 0.4:
+                    best_edge = edge
+                    best_confidence = confidence
+                    best_outcome = outcome
+        
+        if best_outcome and best_edge > 0:
+            # Calcula tamanho da posição baseado na confiança
+            size_multiplier = 0.5 + (best_confidence * 0.5)  # 0.5 a 1.0
+            position_size = min(
+                self.config.max_position_usdc,
+                self.config.total_bankroll_usdc * self.config.bankroll_risk_pct * size_multiplier
+            )
+            
+            log.info(f"[EDGE] {match} | {best_outcome} | "
+                    f"Edge: {best_edge*100:.2f}% | Confiança: {best_confidence*100:.1f}% | "
+                    f"Size: ${position_size:.2f}")
+            
+            return True, best_outcome, best_edge, position_size
+        
+        return False, "", 0.0, 0.0
+    
+    def should_exit(self, position: Position, match: Match, current_price: float) -> List[Tuple[float, str]]:
+        """
+        Decide se deve sair de uma posição
+        Retorna lista de (percentual_a_sair, motivo)
         """
         exits = []
+        
+        # Atualiza highest price para trailing stop
+        if current_price > position.highest_price:
+            position.highest_price = current_price
+        
+        # Calcula PnL percentual
         pnl_pct = (current_price - position.entry_price) / position.entry_price
         
         # 1. Profit taking em múltiplos níveis
         for target in self.config.profit_targets:
-            if pnl_pct >= target and position.shares > 0:
+            if pnl_pct >= target and position.shares > 0.01:
                 # Sai 30% em cada target
                 exit_pct = 0.3
                 exits.append((exit_pct, f"take_profit_{int(target*100)}%"))
-                position.shares *= (1 - exit_pct)
+                # Nota: não reduzimos shares aqui porque isso é apenas decisão
         
-        # 2. Stop loss progressivo
+        # 2. Stop loss
         for stop in self.config.stop_losses:
-            if pnl_pct <= -stop and position.shares > 0:
-                exit_pct = 0.5 if stop == self.config.stop_losses[0] else 1.0
+            if pnl_pct <= -stop and position.shares > 0.01:
+                exit_pct = 1.0 if stop == max(self.config.stop_losses) else 0.5
                 exits.append((exit_pct, f"stop_loss_{int(stop*100)}%"))
-                position.shares *= (1 - exit_pct)
         
-        # 3. Trailing stop
-        if pnl_pct > 0.2:  # Ativa após 20% de lucro
-            current_stop = current_price * (1 - self.config.trailing_stop_pct)
-            if hasattr(position, 'trailing_high'):
-                if current_price < position.trailing_high * (1 - self.config.trailing_stop_pct):
-                    exits.append((1.0, "trailing_stop"))
-            else:
-                position.trailing_high = max(
-                    getattr(position, 'trailing_high', current_price),
-                    current_price
-                )
+        # 3. Trailing stop (ativa após 15% de lucro)
+        if pnl_pct > 0.15:
+            trailing_stop_price = position.highest_price * (1 - self.config.trailing_stop_pct)
+            if current_price < trailing_stop_price:
+                exits.append((1.0, "trailing_stop"))
         
         # 4. Eventos de jogo
-        if match.status == "live":
+        if match.is_live:
             # Gol a favor
             if ((position.outcome == "home" and match.home_score > match.away_score) or
                 (position.outcome == "away" and match.away_score > match.home_score)):
@@ -536,147 +851,32 @@ class OptimizedStrategy:
                 (position.outcome == "away" and match.home_score > match.away_score)):
                 exits.append((1.0, "adverse_goal"))
         
-        # 5. Fim de jogo
-        if match.status == "finished":
+        # 5. Tempo máximo
+        if position.holding_minutes > self.config.max_hold_minutes:
+            exits.append((1.0, "max_time"))
+        
+        # 6. Fim de jogo
+        if match.is_finished:
             exits.append((1.0, "match_finished"))
         
         return exits
 
-# ============= BOT PRINCIPAL OTIMIZADO =============
-class OptimizedFootballBot:
+# ============= GERENCIADOR DE PORTFOLIO =============
+class PortfolioManager:
+    """Gerencia posições e PnL"""
+    
     def __init__(self):
-        self.config = CONFIG
-        self.client = OptimizedPolymarketClient(CONFIG)
-        self.strategy = OptimizedStrategy(CONFIG)
-        self.arbitrage = ArbitrageEngine(self.client, CONFIG)
-        self.market_making = MarketMakingEngine(self.client, CONFIG)
-        self.portfolio = PortfolioManager()
+        self.positions: Dict[str, Position] = {}
+        self.closed_positions: List[Position] = []
+        self.total_pnl: float = 0.0
+        self.daily_pnl: float = 0.0
+        self.weekly_pnl: float = 0.0
+        self.last_reset = datetime.utcnow().date()
         
-        self.running = False
-        self.last_arb_scan = 0
-        self.last_mm_rebalance = 0
-        
-        log.info("=" * 70)
-        log.info("  POLYMARKET BOT v2.0 - OTIMIZADO PARA LUCRO")
-        log.info(f"  Bankroll: ${CONFIG.total_bankroll_usdc} USDC")
-        log.info(f"  Estratégias: Event-Driven | Arbitragem | Market Making")
-        log.info("=" * 70)
+        self._load_state()
     
-    def run_cycle(self):
-        """Ciclo principal com múltiplas estratégias"""
-        
-        # 1. Estratégia principal (event-driven)
-        self._scan_pregame()
-        self._monitor_live()
-        
-        # 2. Arbitragem (a cada 30s)
-        if time.time() - self.last_arb_scan > 30:
-            opportunities = self.arbitrage.scan_arbitrage()
-            for opp in opportunities[:3]:  # Limita a 3 por ciclo
-                if self.arbitrage.execute_arbitrage(opp):
-                    log.info(f"[ARB] Executada: ${opp.get('expected_profit', 0):.2f}")
-            self.last_arb_scan = time.time()
-        
-        # 3. Market Making (a cada 60s)
-        if time.time() - self.last_mm_rebalance > 60:
-            self.market_making.rebalance()
-            self.last_mm_rebalance = time.time()
-        
-        # 4. Status periódico
-        if int(time.time()) % 300 < 5:  # A cada 5 min
-            self._print_status()
-    
-    def _scan_pregame(self):
-        """Versão otimizada do scan pre-game"""
-        if len(self.portfolio.positions) >= self.config.max_open_positions:
-            return
-        
-        balance = self.client.get_usdc_balance()
-        
-        for match in self._get_filtered_matches():
-            should_enter, outcome, edge, size = self.strategy.should_enter(match, balance)
-            
-            if should_enter:
-                token_id = self._get_token_id(match, outcome)
-                
-                # Estratégia híbrida: tenta maker primeiro, se falhar vai de taker
-                order = self.client.place_smart_order(
-                    token_id, size, "buy", "limit"  # Tenta maker primeiro
-                )
-                
-                if not order["success"]:
-                    # Fallback para market order
-                    order = self.client.place_smart_order(
-                        token_id, size, "buy", "market"
-                    )
-                
-                if order["success"]:
-                    self._open_position(match, outcome, token_id, size, order)
-                    
-                    # Adiciona para market making depois
-                    if self.config.enable_market_making:
-                        self.market_making.add_market(token_id, getattr(match, f"{outcome}_odds"))
-    
-    def _monitor_live(self):
-        """Monitora posições abertas com saídas em múltiplos níveis"""
-        if not self.portfolio.positions:
-            return
-        
-        for pos_id, position in list(self.portfolio.positions.items()):
-            match = position.match
-            current_price = self.client.get_best_prices(position.token_id)[1]  # Ask price
-            
-            # Obtém decisões de saída em múltiplos níveis
-            exit_decisions = self.strategy.should_exit_advanced(
-                position, match, current_price
-            )
-            
-            for exit_pct, reason in exit_decisions:
-                if exit_pct <= 0 or position.shares <= 0:
-                    continue
-                
-                shares_to_sell = position.shares * exit_pct
-                
-                # Vende a parcela
-                sell_order = self.client.place_smart_order(
-                    position.token_id,
-                    shares_to_sell * current_price,  # size em USDC
-                    "sell",
-                    "market"
-                )
-                
-                if sell_order["success"]:
-                    position.shares -= shares_to_sell
-                    pnl_pct = (current_price - position.entry_price) / position.entry_price
-                    
-                    log.info(f"[EXIT] {pos_id[:8]} | {exit_pct*100:.0f}% | "
-                            f"PnL: {pnl_pct*100:.1f}% | {reason}")
-            
-            # Se vendeu tudo, fecha posição
-            if position.shares <= 0.001:  # Tolerância para floating point
-                self.portfolio.close_position(pos_id, current_price, reason)
-
-# ============= MAIN =============
-if __name__ == "__main__":
-    import sys
-    
-    if not CONFIG.simulation_mode:
-        print("\n" + "!" * 60)
-        print("!!! ATENÇÃO: MODO LIVE TRADING ATIVO !!!")
-        print("!" * 60)
-        confirm = input("Digite CONFIRMAR para prosseguir: ").strip()
-        if confirm != "CONFIRMAR":
-            sys.exit(0)
-    
-    bot = OptimizedFootballBot()
-    
-    try:
-        schedule.every(5).seconds.do(bot.run_cycle)
-        
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
-            
-    except KeyboardInterrupt:
-        log.info("[STOP] Bot finalizado")
-        bot.print_status()
+    def add_position(self, position: Position):
+        """Adiciona nova posição"""
+        self.positions[position.position_id] = position
+        log.info(f"[OPEN] {position.match} | {position.outcome} | "
+                f"${
