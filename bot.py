@@ -3,17 +3,6 @@
          POLYMARKET FOOTBALL BOT - Automatic Trading Agent
    Strategy: Pre-game buy + In-game sell on events (goals)
 =================================================================
-
-SETUP:
-  pip install py-clob-client web3 requests python-dotenv websocket-client schedule
-
-REQUIRED ENV VARS (.env file):
-  POLYMARKET_API_KEY=your_api_key
-  POLYMARKET_API_SECRET=your_api_secret
-  POLYMARKET_API_PASSPHRASE=your_passphrase
-  POLYMARKET_PRIVATE_KEY=your_wallet_private_key   # Polygon wallet
-  ODDS_API_KEY=your_theoddsapi_key                 # https://the-odds-api.com
-  SPORTRADAR_API_KEY=your_sportradar_key           # For live events (optional)
 """
 
 import os
@@ -27,7 +16,6 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 
-# Polymarket CLOB client
 try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import OrderArgs, Side
@@ -39,63 +27,52 @@ except ImportError:
 
 load_dotenv()
 
-# 
-#  LOGGING
-# 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
 )
 log = logging.getLogger("PolyBot")
 
 
-# 
-#  CONFIGURATION
-# 
+def telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=5)
+    except Exception as e:
+        log.debug("Telegram error: " + str(e))
+
+
 @dataclass
 class BotConfig:
-    # Capital management
-    max_position_usdc: float = 50.0          # Max USDC per bet
-    max_open_positions: int = 5              # Max simultaneous bets
-    total_bankroll_usdc: float = 500.0       # Total bankroll
-    bankroll_risk_pct: float = 0.05          # Risk 5% per bet
-
-    # Entry filters (pre-game)
-    min_odds: float = 0.25                   # Min probability (25%)
-    max_odds: float = 0.75                   # Max probability (75%)
-    min_liquidity_usdc: float = 1000.0       # Min market liquidity
-    min_hours_before_game: float = 1.0       # Open position at least 1h before
-    max_hours_before_game: float = 48.0      # Max 48h before game
-
-    # Exit strategy (in-game events)
-    sell_on_favorable_goal: bool = True      # Sell when team we bet on scores
-    sell_on_adverse_goal: bool = True        # Cut loss when opponent scores
-    profit_target_pct: float = 0.30          # Take profit at +30%
-    stop_loss_pct: float = 0.40              # Stop loss at -40%
-    sell_after_minutes: int = 70             # Force sell at minute 70+
-
-    # Polymarket API
+    max_position_usdc: float = 50.0
+    max_open_positions: int = 5
+    total_bankroll_usdc: float = 500.0
+    bankroll_risk_pct: float = 0.05
+    min_odds: float = 0.25
+    max_odds: float = 0.75
+    min_hours_before_game: float = 1.0
+    max_hours_before_game: float = 48.0
+    sell_on_favorable_goal: bool = True
+    sell_on_adverse_goal: bool = True
+    profit_target_pct: float = 0.30
+    stop_loss_pct: float = 0.40
+    sell_after_minutes: int = 70
     host: str = "https://clob.polymarket.com"
     chain_id: int = POLYGON if CLOB_AVAILABLE else 137
-
-    # Live data
     odds_api_key: str = field(default_factory=lambda: os.getenv("ODDS_API_KEY", ""))
     sportradar_key: str = field(default_factory=lambda: os.getenv("SPORTRADAR_API_KEY", ""))
-
-    # Simulation mode (no real money)
-    simulation_mode: bool = True  # Set to False for live trading!
+    simulation_mode: bool = True
 
 
 CONFIG = BotConfig()
 
 
-# 
-#  DATA MODELS
-# 
 @dataclass
 class Match:
     match_id: str
@@ -110,38 +87,33 @@ class Match:
     home_odds: float = 0.0
     draw_odds: float = 0.0
     away_odds: float = 0.0
-    # Live data
     minute: int = 0
     home_score: int = 0
     away_score: int = 0
-    status: str = "scheduled"  # scheduled | live | finished
+    status: str = "scheduled"
 
 
 @dataclass
 class Position:
     position_id: str
     match: Match
-    outcome: str           # "home" | "draw" | "away"
+    outcome: str
     token_id: str
     entry_price: float
     size_usdc: float
     shares: float
     entry_time: datetime
-    status: str = "open"   # open | sold | expired
+    status: str = "open"
     exit_price: float = 0.0
     pnl_usdc: float = 0.0
     sell_reason: str = ""
 
 
-# 
-#  POLYMARKET CLIENT WRAPPER
-# 
 class PolymarketClient:
     def __init__(self, config: BotConfig):
         self.config = config
         self.client = None
         self.simulation_mode = config.simulation_mode
-
         if not self.simulation_mode and CLOB_AVAILABLE:
             self._init_real_client()
         else:
@@ -159,355 +131,185 @@ class PolymarketClient:
             self.client.set_api_creds(self.client.create_or_derive_api_creds())
             log.info("[OK] Polymarket client initialized")
         except Exception as e:
-            log.error(f"Failed to init Polymarket client: {e}")
+            log.error("Failed to init: " + str(e))
             self.simulation_mode = True
 
-    def get_football_markets(self) -> list[dict]:
-        """Fetch active football markets from Polymarket"""
+    def get_mid_price(self, token_id):
         try:
-            url = "https://gamma-api.polymarket.com/markets"
-            params = {
-                "active": "true",
-                "closed": "false",
-                "tag_slug": "soccer",
-                "limit": 100
-            }
-            resp = requests.get(url, params=params, timeout=10)
-            resp.raise_for_status()
-            markets = resp.json()
-            log.info(f"[INFO] Found {len(markets)} football markets")
-            return markets
-        except Exception as e:
-            log.error(f"Error fetching markets: {e}")
-            return []
-
-    def get_market_orderbook(self, token_id: str) -> dict:
-        """Get current orderbook for a token"""
-        try:
-            url = f"https://clob.polymarket.com/book?token_id={token_id}"
-            resp = requests.get(url, timeout=5)
-            return resp.json()
-        except Exception as e:
-            log.error(f"Error fetching orderbook: {e}")
-            return {}
-
-    def get_mid_price(self, token_id: str) -> float:
-        """Get mid price from orderbook"""
-        book = self.get_market_orderbook(token_id)
-        try:
-            best_bid = float(book["bids"][0]["price"]) if book.get("bids") else 0
-            best_ask = float(book["asks"][0]["price"]) if book.get("asks") else 1
+            url = "https://clob.polymarket.com/book?token_id=" + token_id
+            resp = requests.get(url, timeout=5).json()
+            best_bid = float(resp["bids"][0]["price"]) if resp.get("bids") else 0
+            best_ask = float(resp["asks"][0]["price"]) if resp.get("asks") else 1
             return (best_bid + best_ask) / 2
         except:
             return 0.0
 
-    def place_buy_order(self, token_id: str, size_usdc: float, price: float) -> dict:
-        """Place a buy (YES) order"""
+    def place_buy_order(self, token_id, size_usdc, price):
         if self.simulation_mode:
-            sim_id = f"SIM-{int(time.time())}"
-            log.info(f"[SIM] BUY {size_usdc:.2f} USDC @ {price:.4f} | token={token_id[:12]}...")
-            return {"success": True, "order_id": sim_id, "simulated": True}
-
+            log.info("[SIM] BUY " + str(size_usdc) + " USDC @ " + str(round(price, 4)))
+            return {"success": True, "order_id": "SIM-" + str(int(time.time())), "simulated": True}
         try:
             shares = size_usdc / price
-            order_args = OrderArgs(
-                price=price,
-                size=shares,
-                side=Side.BUY,
-                token_id=token_id,
-            )
-            resp = self.client.create_and_post_order(order_args)
-            log.info(f"[OK] BUY order placed: {resp}")
-            return {"success": True, "order_id": resp.get("orderID", ""), "response": resp}
+            resp = self.client.create_and_post_order(OrderArgs(price=price, size=shares, side=Side.BUY, token_id=token_id))
+            return {"success": True, "order_id": resp.get("orderID", "")}
         except Exception as e:
-            log.error(f"[ERROR] BUY order failed: {e}")
             return {"success": False, "error": str(e)}
 
-    def place_sell_order(self, token_id: str, shares: float, price: float) -> dict:
-        """Place a sell order"""
+    def place_sell_order(self, token_id, shares, price):
         if self.simulation_mode:
-            sim_id = f"SIM-SELL-{int(time.time())}"
-            log.info(f"[SIM] SELL {shares:.4f} shares @ {price:.4f} | token={token_id[:12]}...")
-            return {"success": True, "order_id": sim_id, "simulated": True}
-
+            log.info("[SIM] SELL " + str(round(shares, 4)) + " @ " + str(round(price, 4)))
+            return {"success": True, "order_id": "SIM-SELL-" + str(int(time.time())), "simulated": True}
         try:
-            order_args = OrderArgs(
-                price=price,
-                size=shares,
-                side=Side.SELL,
-                token_id=token_id,
-            )
-            resp = self.client.create_and_post_order(order_args)
-            log.info(f"[OK] SELL order placed: {resp}")
-            return {"success": True, "order_id": resp.get("orderID", ""), "response": resp}
+            resp = self.client.create_and_post_order(OrderArgs(price=price, size=shares, side=Side.SELL, token_id=token_id))
+            return {"success": True, "order_id": resp.get("orderID", "")}
         except Exception as e:
-            log.error(f"[ERROR] SELL order failed: {e}")
             return {"success": False, "error": str(e)}
 
-    def get_usdc_balance(self) -> float:
-        """Get wallet USDC balance"""
+    def get_usdc_balance(self):
         if self.simulation_mode:
             return CONFIG.total_bankroll_usdc
         try:
-            balance = self.client.get_balance()
-            return float(balance)
+            return float(self.client.get_balance())
         except:
             return 0.0
 
 
-# 
-#  LIVE FOOTBALL DATA - CORRIGIDO!
-# 
 class FootballDataClient:
     def __init__(self, config: BotConfig):
-        self.config = config
         self.odds_api_key = config.odds_api_key
         self.sportradar_key = config.sportradar_key
 
     def get_upcoming_matches(self) -> List[Match]:
-        """Get upcoming football matches with odds"""
         if not self.odds_api_key:
             log.warning("No ODDS_API_KEY set. Using mock data.")
             return self._mock_upcoming_matches()
-
         try:
-            leagues = [
-                "soccer_epl",
-                "soccer_spain_la_liga",
-                "soccer_italy_serie_a"
-            ]
+            leagues = ["soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a", "soccer_brazil_campeonato"]
             matches = []
-
             for league in leagues:
-                url = f"https://api.the-odds-api.com/v4/sports/{league}/odds/"
-                params = {
-                    "apiKey": self.odds_api_key,
-                    "regions": "eu",
-                    "markets": "h2h",
-                    "oddsFormat": "decimal",
-                    "dateFormat": "iso"
-                }
-                resp = requests.get(url, params=params, timeout=10)
-                resp.raise_for_status()
-                data = resp.json()
-
-                for game in data:
-                    match = self._parse_odds_api_game(game)
-                    if match:
-                        matches.append(match)
-
-            log.info(f"[INFO] Found {len(matches)} upcoming matches")
+                params = {"apiKey": self.odds_api_key, "regions": "eu", "markets": "h2h", "oddsFormat": "decimal", "dateFormat": "iso"}
+                resp = requests.get("https://api.the-odds-api.com/v4/sports/" + league + "/odds/", params=params, timeout=10)
+                if resp.status_code != 200:
+                    continue
+                for game in resp.json():
+                    m = self._parse(game)
+                    if m:
+                        matches.append(m)
+            log.info("[INFO] Found " + str(len(matches)) + " upcoming matches")
             return matches
-
         except Exception as e:
-            log.error(f"Error fetching odds: {e}")
+            log.error("Error fetching odds: " + str(e))
             return self._mock_upcoming_matches()
 
-    def _parse_odds_api_game(self, game: dict) -> Optional[Match]:
+    def _parse(self, game) -> Optional[Match]:
         try:
             start = datetime.fromisoformat(game["commence_time"].replace("Z", "+00:00"))
-            bookmakers = game.get("bookmakers", [])
-            if not bookmakers:
+            bk = game.get("bookmakers", [])
+            if not bk:
                 return None
-            outcomes = bookmakers[0]["markets"][0]["outcomes"]
+            outcomes = bk[0]["markets"][0]["outcomes"]
             odds_map = {o["name"]: 1 / o["price"] for o in outcomes}
             home = game["home_team"]
             away = game["away_team"]
-            return Match(
-                match_id=game["id"],
-                home_team=home,
-                away_team=away,
-                start_time=start,
-                league=game.get("sport_title", "Football"),
-                home_odds=odds_map.get(home, 0.4),
-                draw_odds=odds_map.get("Draw", 0.3),
-                away_odds=odds_map.get(away, 0.3),
-            )
-        except Exception as e:
-            log.debug(f"Parse error: {e}")
+            return Match(match_id=game["id"], home_team=home, away_team=away, start_time=start,
+                         league=game.get("sport_title", "Football"),
+                         home_odds=odds_map.get(home, 0.4), draw_odds=odds_map.get("Draw", 0.3), away_odds=odds_map.get(away, 0.3))
+        except:
             return None
 
     def get_live_score(self, match: Match) -> Tuple[int, int, int, str]:
-        """Returns (minute, home_score, away_score, status)"""
         if not self.sportradar_key:
             return self._mock_live_score(match)
-
         try:
-            url = f"https://api.sportradar.com/soccer/trial/v4/en/matches/{match.match_id}/timeline.json"
-            params = {"api_key": self.sportradar_key}
-            resp = requests.get(url, params=params, timeout=5)
-            resp.raise_for_status()
-            data = resp.json()
-            sport_event = data.get("sport_event_status", {})
-            return (
-                sport_event.get("match_time", 0),
-                sport_event.get("home_score", 0),
-                sport_event.get("away_score", 0),
-                sport_event.get("status", "live")
-            )
-        except Exception as e:
-            log.debug(f"Live score error: {e}")
+            resp = requests.get("https://api.sportradar.com/soccer/trial/v4/en/matches/" + match.match_id + "/timeline.json",
+                                params={"api_key": self.sportradar_key}, timeout=5)
+            s = resp.json().get("sport_event_status", {})
+            return s.get("match_time", 0), s.get("home_score", 0), s.get("away_score", 0), s.get("status", "live")
+        except:
             return self._mock_live_score(match)
 
     def _mock_upcoming_matches(self) -> List[Match]:
-        """Mock data for testing"""
         now = datetime.utcnow()
         return [
-            Match(
-                match_id="mock_1",
-                home_team="Arsenal",
-                away_team="Chelsea",
-                start_time=now + timedelta(hours=3),
-                league="Premier League",
-                home_win_token_id="mock_token_home_1",
-                home_odds=0.45,
-                draw_odds=0.28,
-                away_odds=0.27,
-            ),
-            Match(
-                match_id="mock_2",
-                home_team="Barcelona",
-                away_team="Real Madrid",
-                start_time=now + timedelta(hours=26),
-                league="La Liga",
-                home_win_token_id="mock_token_home_2",
-                home_odds=0.50,
-                draw_odds=0.25,
-                away_odds=0.25,
-            ),
+            Match(match_id="mock_1", home_team="Arsenal", away_team="Chelsea",
+                  start_time=now + timedelta(hours=3), league="Premier League",
+                  home_win_token_id="mock_token_home_1", home_odds=0.45, draw_odds=0.28, away_odds=0.27),
+            Match(match_id="mock_2", home_team="Barcelona", away_team="Real Madrid",
+                  start_time=now + timedelta(hours=26), league="La Liga",
+                  home_win_token_id="mock_token_home_2", home_odds=0.50, draw_odds=0.25, away_odds=0.25),
         ]
 
     def _mock_live_score(self, match: Match) -> Tuple[int, int, int, str]:
-        """Simulate live match for testing"""
         elapsed = (datetime.utcnow() - match.start_time).total_seconds() / 60
         minute = max(0, min(90, int(elapsed)))
         if minute < 1:
             return 0, 0, 0, "not_started"
         if minute >= 90:
             return 90, 1, 0, "finished"
-        # Simulate a goal at minute 35
-        home_score = 1 if minute > 35 else 0
-        return minute, home_score, 0, "live"
+        return minute, (1 if minute > 35 else 0), 0, "live"
 
 
-# 
-#  STRATEGY ENGINE
-# 
 class StrategyEngine:
     def __init__(self, config: BotConfig):
         self.config = config
-        self.min_edge = 0.05
-        self.max_edge = 0.25
-
-    def model_probability(self, match: Match) -> dict:
-        """Simple model based on bookmaker odds"""
-        home = match.home_odds
-        draw = match.draw_odds
-        away = match.away_odds
-        total = home + draw + away
-
-        if total <= 0:
-            return {"home": 0.33, "draw": 0.33, "away": 0.33}
-
-        return {
-            "home": home / total,
-            "draw": draw / total,
-            "away": away / total
-        }
-
-    def calculate_edge(self, model_prob: float, market_price: float) -> float:
-        """EDGE = model probability - market price"""
-        return model_prob - market_price
 
     def should_enter(self, match: Match, available_usdc: float) -> Tuple[bool, str, float]:
         now = datetime.utcnow()
         hours_until = (match.start_time.replace(tzinfo=None) - now).total_seconds() / 3600
-
-        if hours_until < self.config.min_hours_before_game:
-            return False, "", 0
-        if hours_until > self.config.max_hours_before_game:
+        if not (self.config.min_hours_before_game <= hours_until <= self.config.max_hours_before_game):
             return False, "", 0
 
-        model_probs = self.model_probability(match)
+        total = match.home_odds + match.draw_odds + match.away_odds
+        if total <= 0:
+            return False, "", 0
+
         best_edge = 0
         best_outcome = ""
-
-        outcomes = [
-            ("home", match.home_odds, match.home_win_token_id),
-            ("away", match.away_odds, match.away_win_token_id),
-        ]
-
-        for outcome, market_price, token in outcomes:
+        for outcome, market_price in [("home", match.home_odds), ("away", match.away_odds)]:
             if market_price <= 0:
                 continue
-            model_prob = model_probs[outcome]
-            edge = self.calculate_edge(model_prob, market_price)
-
-            if self.min_edge < edge < self.max_edge and edge > best_edge:
+            model_prob = market_price / total
+            edge = model_prob - market_price
+            if 0.03 < edge < 0.25 and edge > best_edge:
                 best_edge = edge
                 best_outcome = outcome
 
         if best_outcome:
-            log.info(
-                f"[EDGE SIGNAL] {match.home_team} vs {match.away_team} | "
-                f"Outcome: {best_outcome} | Edge: {best_edge:.2%}"
-            )
+            log.info("[EDGE] " + match.home_team + " vs " + match.away_team + " | " + best_outcome + " | " + str(round(best_edge * 100, 1)) + "%")
             return True, best_outcome, best_edge
-
         return False, "", 0
 
     def calculate_position_size(self, available_usdc: float) -> float:
-        size = min(
-            self.config.max_position_usdc,
-            available_usdc * self.config.bankroll_risk_pct
-        )
-        return round(size, 2)
+        return round(min(self.config.max_position_usdc, available_usdc * self.config.bankroll_risk_pct), 2)
 
     def should_exit(self, position: Position, match: Match, current_price: float) -> Tuple[bool, str]:
         pnl_pct = (current_price - position.entry_price) / position.entry_price
-
-        # Take profit
         if pnl_pct >= self.config.profit_target_pct:
-            return True, f"profit_target (+{pnl_pct*100:.1f}%)"
-
-        # Stop loss
+            return True, "profit_target (+" + str(round(pnl_pct * 100, 1)) + "%)"
         if pnl_pct <= -self.config.stop_loss_pct:
-            return True, f"stop_loss ({pnl_pct*100:.1f}%)"
-
-        # Time exit
+            return True, "stop_loss (" + str(round(pnl_pct * 100, 1)) + "%)"
         if match.minute >= self.config.sell_after_minutes:
-            return True, f"time_stop (min {match.minute})"
-
-        # Goal events
+            return True, "time_stop (min " + str(match.minute) + ")"
         if match.status == "live":
-            # Sell on favorable goal
             if self.config.sell_on_favorable_goal and pnl_pct > 0.05:
                 if position.outcome == "home" and match.home_score > match.away_score:
-                    return True, f"favorable_goal (score: {match.home_score}-{match.away_score})"
-                elif position.outcome == "away" and match.away_score > match.home_score:
-                    return True, f"favorable_goal (score: {match.home_score}-{match.away_score})"
-
-            # Cut on adverse goal
+                    return True, "favorable_goal (" + str(match.home_score) + "-" + str(match.away_score) + ")"
+                if position.outcome == "away" and match.away_score > match.home_score:
+                    return True, "favorable_goal (" + str(match.home_score) + "-" + str(match.away_score) + ")"
             if self.config.sell_on_adverse_goal:
                 if position.outcome == "home" and match.away_score > match.home_score:
-                    return True, f"adverse_goal (score: {match.home_score}-{match.away_score})"
-                elif position.outcome == "away" and match.home_score > match.away_score:
-                    return True, f"adverse_goal (score: {match.home_score}-{match.away_score})"
-
-        # Match finished
+                    return True, "adverse_goal (" + str(match.home_score) + "-" + str(match.away_score) + ")"
+                if position.outcome == "away" and match.home_score > match.away_score:
+                    return True, "adverse_goal (" + str(match.home_score) + "-" + str(match.away_score) + ")"
         if match.status == "finished":
             return True, "match_finished"
-
         return False, ""
 
 
-# 
-#  PORTFOLIO MANAGER
-# 
 class PortfolioManager:
     def __init__(self):
-        self.positions: dict[str, Position] = {}
-        self.closed_positions: list[Position] = []
+        self.positions: dict = {}
+        self.closed_positions: list = []
         self.total_pnl: float = 0.0
         self._load_state()
 
@@ -525,7 +327,7 @@ class PortfolioManager:
         pos.sell_reason = reason
         self.total_pnl += pos.pnl_usdc
         self.closed_positions.append(pos)
-        log.info(f"[SELL] Position closed | PnL: {pos.pnl_usdc:+.2f} USDC | Reason: {reason}")
+        log.info("[SELL] Closed | PnL: " + str(round(pos.pnl_usdc, 2)) + " USDC | " + reason)
         self._save_state()
 
     def get_stats(self) -> dict:
@@ -536,21 +338,16 @@ class PortfolioManager:
             "closed_positions": len(self.closed_positions),
             "total_pnl_usdc": round(self.total_pnl, 2),
             "win_rate": len(wins) / len(self.closed_positions) if self.closed_positions else 0,
-            "wins": len(wins),
-            "losses": len(losses),
+            "wins": len(wins), "losses": len(losses),
         }
 
     def _save_state(self):
         try:
-            state = {
-                "positions": {k: asdict(v) for k, v in self.positions.items()},
-                "total_pnl": self.total_pnl,
-                "closed_count": len(self.closed_positions),
-            }
             with open("portfolio_state.json", "w") as f:
-                json.dump(state, f, indent=2, default=str)
+                json.dump({"positions": {k: asdict(v) for k, v in self.positions.items()},
+                           "total_pnl": self.total_pnl}, f, indent=2, default=str)
         except Exception as e:
-            log.debug(f"Save state error: {e}")
+            log.debug("Save error: " + str(e))
 
     def _load_state(self):
         try:
@@ -558,173 +355,142 @@ class PortfolioManager:
                 with open("portfolio_state.json") as f:
                     state = json.load(f)
                 self.total_pnl = state.get("total_pnl", 0.0)
-                log.info(f"[LOAD] Portfolio loaded | PnL: {self.total_pnl:+.2f} USDC")
+                log.info("[LOAD] Portfolio loaded | PnL: " + str(round(self.total_pnl, 2)) + " USDC")
         except Exception as e:
-            log.debug(f"Load state error: {e}")
+            log.debug("Load error: " + str(e))
 
 
-# 
-#  MAIN BOT
-# 
 class PolymarketFootballBot:
     def __init__(self):
         self.config = CONFIG
         self.poly = PolymarketClient(CONFIG)
-        self.football = FootballDataClient(CONFIG)  # CORRIGIDO: nome da classe correto
+        self.football = FootballDataClient(CONFIG)
         self.strategy = StrategyEngine(CONFIG)
         self.portfolio = PortfolioManager()
         self.running = False
-        self._tracked_matches: dict[str, Match] = {}
-
+        self._tracked_matches: dict = {}
         mode = "[SIMULATION]" if CONFIG.simulation_mode else "[LIVE TRADING]"
         log.info("=" * 60)
-        log.info(f"  POLYMARKET FOOTBALL BOT STARTED {mode}")
-        log.info(f"  Bankroll: ${CONFIG.total_bankroll_usdc:.0f} USDC")
-        log.info(f"  Max position: ${CONFIG.max_position_usdc:.0f} USDC")
+        log.info("  POLYMARKET FOOTBALL BOT STARTED " + mode)
+        log.info("  Bankroll: $" + str(CONFIG.total_bankroll_usdc) + " USDC")
         log.info("=" * 60)
 
     def scan_pregame(self):
-        """SCAN FOR NEW BETS"""
         log.info("[SCAN] Scanning for pre-game opportunities...")
-
         if len(self.portfolio.positions) >= self.config.max_open_positions:
-            log.info("[WAIT] Max open positions reached, skipping scan")
+            log.info("[WAIT] Max open positions reached")
             return
 
         balance = self.poly.get_usdc_balance()
-        matches = self.football.get_upcoming_matches()  # CORRIGIDO: método existe agora
-
-        for match in matches:
+        for match in self.football.get_upcoming_matches():
             if match.match_id in self._tracked_matches:
                 continue
-
             should_enter, outcome, score = self.strategy.should_enter(match, balance)
-
             if not should_enter:
                 continue
 
-            # Get token ID based on outcome
-            token_id = self._get_token_for_outcome(match, outcome)
-            if not token_id:
-                log.warning(f"No token ID for {match.home_team} vs {match.away_team} ({outcome})")
-                continue
-
-            # Get current price
-            current_price = self.poly.get_mid_price(token_id)
-            if current_price <= 0:
-                current_price = match.home_odds if outcome == "home" else match.away_odds
-
-            # Calculate size
+            token_id = self._get_token(match, outcome)
+            current_price = self.poly.get_mid_price(token_id) or (match.home_odds if outcome == "home" else match.away_odds)
             size_usdc = self.strategy.calculate_position_size(balance)
-
-            # Place order
             result = self.poly.place_buy_order(token_id, size_usdc, current_price)
 
             if result["success"]:
-                shares = size_usdc / current_price
-                position = Position(
-                    position_id=result["order_id"],
-                    match=match,
-                    outcome=outcome,
-                    token_id=token_id,
-                    entry_price=current_price,
-                    size_usdc=size_usdc,
-                    shares=shares,
-                    entry_time=datetime.utcnow(),
+                pos = Position(
+                    position_id=result["order_id"], match=match, outcome=outcome,
+                    token_id=token_id, entry_price=current_price, size_usdc=size_usdc,
+                    shares=size_usdc / current_price, entry_time=datetime.utcnow(),
                 )
-                self.portfolio.add_position(position)
+                self.portfolio.add_position(pos)
                 self._tracked_matches[match.match_id] = match
-                log.info(
-                    f"[BUY] NEW POSITION | {match.home_team} vs {match.away_team} | "
-                    f"Outcome: {outcome} | Size: ${size_usdc:.2f} | Price: {current_price:.4f}"
+                log.info("[BUY] " + match.home_team + " vs " + match.away_team + " | " + outcome + " | $" + str(size_usdc))
+
+                telegram(
+                    "<b>[COMPRA]</b> " + match.home_team + " vs " + match.away_team + "\n" +
+                    "Aposta: <b>" + outcome.upper() + "</b>\n" +
+                    "Valor: $" + str(size_usdc) + " USDC\n" +
+                    "Preco: " + str(round(current_price, 4)) + "\n" +
+                    "Liga: " + match.league
                 )
 
     def monitor_live(self):
-        """MONITOR LIVE POSITIONS"""
         if not self.portfolio.positions:
             return
-
-        log.info(f"[LIVE] Monitoring {len(self.portfolio.positions)} open positions...")
-
+        log.info("[LIVE] Monitoring " + str(len(self.portfolio.positions)) + " positions...")
         to_close = []
 
         for pos_id, position in list(self.portfolio.positions.items()):
             match = position.match
+            minute, hs, as_, status = self.football.get_live_score(match)
+            match.minute, match.home_score, match.away_score, match.status = minute, hs, as_, status
 
-            # Get live score
-            minute, home_score, away_score, status = self.football.get_live_score(match)
-            match.minute = minute
-            match.home_score = home_score
-            match.away_score = away_score
-            match.status = status
-
-            # Get current market price
-            current_price = self.poly.get_mid_price(position.token_id)
-            if current_price <= 0:
-                current_price = position.entry_price
-
+            current_price = self.poly.get_mid_price(position.token_id) or position.entry_price
             pnl_pct = (current_price - position.entry_price) / position.entry_price
-            log.info(
-                f"  [MATCH] {match.home_team} {home_score}-{away_score} {match.away_team} "
-                f"[{minute}'] | PnL: {pnl_pct:+.1%} | Price: {current_price:.4f}"
-            )
+            log.info("  [MATCH] " + match.home_team + " " + str(hs) + "-" + str(as_) + " " + match.away_team +
+                     " [" + str(minute) + "'] PnL: " + str(round(pnl_pct * 100, 1)) + "%")
 
-            # Check exit condition
             should_exit, reason = self.strategy.should_exit(position, match, current_price)
-
             if should_exit:
                 to_close.append((pos_id, current_price, reason))
 
-        # Execute sells
         for pos_id, price, reason in to_close:
             position = self.portfolio.positions.get(pos_id)
             if not position:
                 continue
             result = self.poly.place_sell_order(position.token_id, position.shares, price)
             if result["success"]:
+                pnl = (price - position.entry_price) * position.shares
                 self.portfolio.close_position(pos_id, price, reason)
+                resultado = "LUCRO" if pnl >= 0 else "PERDA"
+                telegram(
+                    "<b>[" + resultado + "]</b> " + position.match.home_team + " vs " + position.match.away_team + "\n" +
+                    "Aposta: " + position.outcome.upper() + "\n" +
+                    "Motivo: " + reason + "\n" +
+                    "PnL: $" + str(round(pnl, 2)) + " USDC\n" +
+                    "Placar: " + str(position.match.home_score) + "-" + str(position.match.away_score)
+                )
 
-    def _get_token_for_outcome(self, match: Match, outcome: str) -> str:
-        """GET TOKEN ID FOR OUTCOME"""
+    def _get_token(self, match: Match, outcome: str) -> str:
         if outcome == "home":
-            return match.home_win_token_id or f"mock_token_{match.match_id}_home"
+            return match.home_win_token_id or "mock_token_" + match.match_id + "_home"
         elif outcome == "draw":
-            return match.draw_token_id or f"mock_token_{match.match_id}_draw"
-        elif outcome == "away":
-            return match.away_win_token_id or f"mock_token_{match.match_id}_away"
-        return ""
+            return match.draw_token_id or "mock_token_" + match.match_id + "_draw"
+        return match.away_win_token_id or "mock_token_" + match.match_id + "_away"
 
     def print_status(self):
-        """PRINT STATUS"""
         stats = self.portfolio.get_stats()
         balance = self.poly.get_usdc_balance()
-        log.info("")
-        log.info("================================================")
-        log.info("               BOT STATUS                      ")
-        log.info("================================================")
-        log.info(f"  Balance:        ${balance:.2f} USDC")
-        log.info(f"  Open positions: {stats['open_positions']}")
-        log.info(f"  Closed:         {stats['closed_positions']}")
-        log.info(f"  Total PnL:      ${stats['total_pnl_usdc']:+.2f} USDC")
-        if stats['closed_positions'] > 0:
-            log.info(f"  Win rate:       {stats['win_rate']:.1%} ({stats['wins']}W / {stats['losses']}L)")
-        log.info("================================================")
-        log.info("")
+        log.info("=" * 48)
+        log.info("               BOT STATUS")
+        log.info("=" * 48)
+        log.info("  Balance:   $" + str(round(balance, 2)) + " USDC")
+        log.info("  Open:      " + str(stats["open_positions"]))
+        log.info("  Closed:    " + str(stats["closed_positions"]))
+        log.info("  PnL:       $" + str(stats["total_pnl_usdc"]) + " USDC")
+        if stats["closed_positions"] > 0:
+            log.info("  Win rate:  " + str(round(stats["win_rate"] * 100, 1)) + "% (" + str(stats["wins"]) + "W/" + str(stats["losses"]) + "L)")
+        log.info("=" * 48)
+
+        telegram(
+            "<b>[STATUS]</b> PolyBot\n" +
+            "Balance: $" + str(round(balance, 2)) + " USDC\n" +
+            "Abertas: " + str(stats["open_positions"]) + " | Fechadas: " + str(stats["closed_positions"]) + "\n" +
+            "PnL: $" + str(stats["total_pnl_usdc"]) + " USDC (" + str(stats["wins"]) + "W/" + str(stats["losses"]) + "L)"
+        )
 
     def start(self):
-        """MAIN LOOP"""
         self.running = True
         log.info("[START] Bot started!")
-
-        # Schedule tasks
+        telegram(
+            "<b>[START] PolyBot iniciado!</b>\n" +
+            "Modo: SIMULACAO\n" +
+            "Bankroll: $" + str(CONFIG.total_bankroll_usdc) + " USDC\n" +
+            "Max aposta: $" + str(CONFIG.max_position_usdc) + " USDC"
+        )
         schedule.every(30).minutes.do(self.scan_pregame)
         schedule.every(60).seconds.do(self.monitor_live)
         schedule.every(10).minutes.do(self.print_status)
-
-        # Run immediately on start
         self.scan_pregame()
         self.print_status()
-
         while self.running:
             schedule.run_pending()
             time.sleep(5)
@@ -735,19 +501,12 @@ class PolymarketFootballBot:
         self.print_status()
 
 
-# 
-#  ENTRY POINT
-# 
 if __name__ == "__main__":
     import sys
-
-    # Safety check
     if not CONFIG.simulation_mode:
         print("\n!!! WARNING: LIVE TRADING MODE ACTIVE !!!")
-        print("Real money will be used. Type 'CONFIRM' to proceed:")
-        confirm = input("> ").strip()
+        confirm = input("Type CONFIRM to proceed: ").strip()
         if confirm != "CONFIRM":
-            print("Aborted.")
             sys.exit(0)
 
     bot = PolymarketFootballBot()
