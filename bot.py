@@ -550,6 +550,13 @@ class PolymarketFootballBot:
         log.info(f"  Bankroll: ${CONFIG.total_bankroll_usdc:.2f}")
         log.info(f"  Max posições: {CONFIG.max_open_positions}")
         log.info("="*60)
+        
+        # Notifica Telegram
+        send_telegram(
+            f"<b>🚀 BOT INICIADO</b>\n"
+            f"Modo: {'SIMULAÇÃO' if CONFIG.simulation_mode else 'LIVE'}\n"
+            f"Bankroll: ${CONFIG.total_bankroll_usdc:.2f}"
+        )
     
     def scan_pregame(self):
         """Scan por oportunidades"""
@@ -591,6 +598,14 @@ class PolymarketFootballBot:
                     
                     log.info(f"  🟢 COMPROU {match.home_team} vs {match.away_team}")
                     log.info(f"     {outcome.upper()} @ ${result['price']:.3f} | Edge: {edge*100:.1f}%")
+                    
+                    send_telegram(
+                        f"<b>🟢 COMPRA</b>\n"
+                        f"{match.home_team} vs {match.away_team}\n"
+                        f"Outcome: {outcome.upper()}\n"
+                        f"Valor: ${size:.2f} @ {result['price']:.3f}\n"
+                        f"Edge: {edge*100:.1f}%"
+                    )
     
     def monitor_live(self):
         """Monitora jogos ao vivo"""
@@ -633,6 +648,14 @@ class PolymarketFootballBot:
                     if sell_result["success"]:
                         position.shares *= (1 - pct)
                         log.info(f"     🔴 VENDEU {pct*100:.0f}% | {reason}")
+                        
+                        send_telegram(
+                            f"<b>🔴 VENDA</b>\n"
+                            f"{match.home_team} vs {match.away_team}\n"
+                            f"Motivo: {reason}\n"
+                            f"Parcela: {pct*100:.0f}%\n"
+                            f"PnL: {pnl*100:+.1f}%"
+                        )
             
             # Se vendeu tudo
             if position.shares <= 0.01:
@@ -656,6 +679,15 @@ class PolymarketFootballBot:
         if stats['closed'] > 0:
             log.info(f"  Win Rate: {stats['win_rate']*100:.1f}%")
         log.info("="*60)
+        
+        # Telegram a cada 30 min
+        if int(time.time()) % 1800 < 10:
+            send_telegram(
+                f"<b>📊 STATUS</b>\n"
+                f"Posições: {stats['open']} abertas\n"
+                f"PnL Hoje: ${stats['daily_pnl']:.2f}\n"
+                f"Win Rate: {stats['win_rate']*100:.1f}%"
+            )
     
     def run_cycle(self):
         """Ciclo principal"""
@@ -673,7 +705,7 @@ class PolymarketFootballBot:
                 self.print_status()
                 
         except Exception as e:
-            log.error(f"Erro: {e}")
+            log.error(f"Erro no ciclo: {e}")
     
     def start(self):
         """Inicia o bot"""
@@ -700,13 +732,22 @@ class PolymarketFootballBot:
         self.running = False
         log.info("\n🛑 BOT FINALIZADO")
         self.print_status()
+        
+        send_telegram(f"<b>🛑 BOT FINALIZADO</b>\nPnL Total: ${self.portfolio.total_pnl:.2f}")
 
 # ============= MAIN =============
 if __name__ == "__main__":
-    print("\n" + "="*60)
-    print("  POLYMARKET FOOTBALL BOT")
-    print("  Versão 3.0 - Modo Simulação")
-    print("="*60)
+    print("\n" + "🚀"*30)
+    print("  POLYMARKET FOOTBALL BOT v3.0")
+    print("  Modo: SIMULAÇÃO")
+    print("🚀"*30 + "\n")
     
     bot = PolymarketFootballBot()
-    bot.start()
+    
+    try:
+        bot.start()
+    except KeyboardInterrupt:
+        bot.stop()
+    except Exception as e:
+        log.error(f"Erro fatal: {e}")
+        bot.stop()
