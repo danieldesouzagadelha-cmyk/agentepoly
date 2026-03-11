@@ -260,63 +260,60 @@ class PolymarketClient:
 #  LIVE FOOTBALL DATA
 # 
 class FootballDataClient:
-    """
-    Fetches live football scores and events.
-    Uses The Odds API for pre-game odds.
-    Uses Sportradar (or API-Football) for live scores.
-    """
+
     def __init__(self, config: BotConfig):
         self.config = config
         self.odds_api_key = config.odds_api_key
         self.sportradar_key = config.sportradar_key
 
-def get_upcoming_matches(self) -> list[Match]:
-    """Get upcoming football matches with odds"""
 
-    if not self.odds_api_key:
-        log.warning("No ODDS_API_KEY set. Using mock data.")
-        return self._mock_upcoming_matches()
+    def get_upcoming_matches(self) -> list[Match]:
+        """Get upcoming football matches with odds"""
 
-    try:
+        if not self.odds_api_key:
+            log.warning("No ODDS_API_KEY set. Using mock data.")
+            return self._mock_upcoming_matches()
 
-        leagues = [
-            "soccer_epl",
-            "soccer_spain_la_liga",
-            "soccer_italy_serie_a"
-        ]
+        try:
 
-        matches = []
+            leagues = [
+                "soccer_epl",
+                "soccer_spain_la_liga",
+                "soccer_italy_serie_a"
+            ]
 
-        for league in leagues:
+            matches = []
 
-            url = f"https://api.the-odds-api.com/v4/sports/{league}/odds/"
+            for league in leagues:
 
-            params = {
-                "apiKey": self.odds_api_key,
-                "regions": "eu",
-                "markets": "h2h",
-                "oddsFormat": "decimal",
-                "dateFormat": "iso"
-            }
+                url = f"https://api.the-odds-api.com/v4/sports/{league}/odds/"
 
-            resp = requests.get(url, params=params, timeout=10)
-            resp.raise_for_status()
+                params = {
+                    "apiKey": self.odds_api_key,
+                    "regions": "eu",
+                    "markets": "h2h",
+                    "oddsFormat": "decimal",
+                    "dateFormat": "iso"
+                }
 
-            data = resp.json()
+                resp = requests.get(url, params=params, timeout=10)
+                resp.raise_for_status()
 
-            for game in data:
-                match = self._parse_odds_api_game(game)
+                data = resp.json()
 
-                if match:
-                    matches.append(match)
+                for game in data:
+                    match = self._parse_odds_api_game(game)
 
-        log.info(f"[INFO] Found {len(matches)} upcoming matches")
+                    if match:
+                        matches.append(match)
 
-        return matches
+            log.info(f"[INFO] Found {len(matches)} upcoming matches")
 
-    except Exception as e:
-        log.error(f"Error fetching odds: {e}")
-        return self._mock_upcoming_matches()
+            return matches
+
+        except Exception as e:
+            log.error(f"Error fetching odds: {e}")
+            return self._mock_upcoming_matches()
 
     def _parse_odds_api_game(self, game: dict) -> Optional[Match]:
         try:
