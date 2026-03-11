@@ -862,6 +862,7 @@ class StrategyEngine:
         return exits
 
 # ============= GERENCIADOR DE PORTFOLIO =============
+# ============= GERENCIADOR DE PORTFOLIO =============
 class PortfolioManager:
     """Gerencia posições e PnL"""
     
@@ -878,5 +879,135 @@ class PortfolioManager:
     def add_position(self, position: Position):
         """Adiciona nova posição"""
         self.positions[position.position_id] = position
-        log.info(f"[OPEN] {position.match} | {position.outcome} | "
-                f"${
+        log.info(f"[OPEN] {position.match} | {position.outcome} | ${position.size_usdc:.2f}")
+        self._save_state()
+    
+    def close_position(self, position_id: str, exit_price: float, reason: str):
+        """Fecha uma posição"""
+        if position_id not in self.positions:
+            return
+        
+        pos = self.positions.pop(position_id)
+        pos.status = "closed"
+        pos.exit_price = exit_price
+        pos.pnl_usdc = (exit_price - pos.entry_price) * pos.shares
+        pos.pnl_percent = (exit_price - pos.entry_price) / pos.entry_price
+        pos.sell_reason = reason
+        
+        # Atualiza PnL
+        self.total_pnl += pos.pnl_usdc
+        self.daily_pnl += pos.pnl_usdc
+        self.weekly_pnl += pos.pnl_usdc
+        self.closed_positions.append(pos)
+        
+        # Log
+        result = "✅ LUCRO" if pos.pnl_usdc >= 0 else "❌ PERDA"
+        log.info(f"[CLOSE] {result} | {pos.match} | {pos.outcome} | "
+                f"PnL: ${pos.pnl_usdc:.2f} ({pos.pnl_percent*100:.1f}%) | {reason}")
+        
+        self._save_state()
+    
+    def get_open_positions(self) -> List[Position]:
+        """Retorna posições abertas"""
+        return list(self.positions.values())
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Retorna estatísticas do portfolio"""
+        wins = [p for p in self.closed_positions if p.pnl_usdc > 0]
+        losses = [p for p in self.closed_positions if p.pnl_usdc <= 0]
+        
+        total_closed = len(self.closed_positions)
+        win_rate = len(wins) / total_closed if total_closed > 0 else 0
+        
+        # Média de lucro/perda
+        avg_win = sum(p.pnl_usdc for p in wins) / len(wins) if wins else 0
+        avg_loss = sum(p.pnl_usdc for p in losses) / len(losses) if losses else 0
+        
+        return {
+            "open_positions": len(self.positions),
+            "closed_positions": total_closed,
+            "total_pnl": self.total_pnl,
+            "daily_pnl": self.daily_pnl,
+            "weekly_pnl": self.weekly_pnl,
+            "win_rate": win_rate,
+            "wins": len(wins),
+            "losses": len(losses),
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "profit_factor": abs(avg_win / avg_loss) if avg_loss != 0 else 0
+        }
+    
+    def reset_daily(self):
+        """Reset contador diário"""
+        self.daily_pnl = 0.0
+        self.last_reset = datetime.utcnow().date()
+        log.info("[RESET] Daily PnL reset")
+    
+    def check_limits(self) -> Tuple[bool, str]:
+        """Verifica se limites foram atingidos"""
+        # Limite diário
+        if abs(self.daily_pnl) >= CONFIG.daily_loss_limit:
+            return True, f"Daily loss limit reached: ${self.daily_pnl:.2f}"
+        
+        # Limite semanal
+        if abs(self.weekly_pnl) >= CONFIG.weekly_loss_limit:
+            return True, f"Weekly loss limit reached: ${self.weekly_pnl:.2f}"
+        
+        return False, ""
+    
+    def _save_state(self):
+        """Salva estado em arquivo"""
+        try:
+            state = {
+                "positions": {
+                    k: {
+                        "position_id": v.position_id,
+                        "match_id": v.match.match_id,
+                        "outcome": v.outcome,
+                        "token_id": v.token_id,
+                        "entry_price": v.entry_price,
+                        "size_usdc": v.size_usdc,
+                        "shares": v.shares,
+                        "entry_time": v.entry_time.isoformat(),
+                        "status": v.status,
+                        "highest_price": v.highest_price
+                    }
+                    for k, v in self.positions.items()
+                },
+                "total_pnl": self.total_pnl,
+                "daily_pnl": self.daily_pnl,
+                "weekly_pnl": self.weekly_pnl,
+                "last_reset": self.last_reset.isoformat()
+            }
+            
+            with open("portfolio_state.json", "w") as f:
+                json.dump(state, f, indent=2)
+                
+        except Exception as e:
+            log.debug(f"Erro ao salvar estado: {e}")
+    
+    def _load_state(self):
+        """Carrega estado do arquivo"""
+        try:
+            if not os.path.exists("portfolio_state.json"):
+                return
+            
+            with open("portfolio_state.json", "r") as f:
+                state = json.load(f)
+            
+            self.total_pnl = state.get("total_pnl", 0.0)
+            self.daily_pnl = state.get("daily_pnl", 0.0)
+            self.weekly_pnl = state.get("weekly_pnl", 0.0)
+            
+            last_reset = state.get("last_reset")
+            if last_reset:
+                self.last_reset = datetime.fromisoformat(last_reset).date()
+            
+            # Se mudou de dia, reseta daily
+            if self.last_reset != datetime.utcnow().date():
+                self.reset_daily()
+            
+            log.info(f"[LOAD] Portfolio carregado | PnL Total: ${self.total_pnl:.2f}")
+            
+        except Exception as e:
+            log.debug(f"Erro ao carregar estado: {e}")
