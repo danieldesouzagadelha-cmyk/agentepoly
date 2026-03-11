@@ -29,9 +29,9 @@ class Config:
     USE_REAL_DATA = True    # True = dados REAIS da Polymarket
     
     # ===== GESTÃO DE RISCO VIRTUAL =====
-    MAX_POSITION_USDC = 10.0        # Tamanho virtual da aposta
+    MAX_POSITION_USDC = 50.0        # Tamanho virtual da aposta
     MAX_OPEN_POSITIONS = 3           # Máximo de posições virtuais
-    VIRTUAL_BANKROLL = 100.0         # Bankroll virtual inicial
+    VIRTUAL_BANKROLL = 1000.0         # Bankroll virtual inicial
     BANKROLL_RISK_PCT = 0.10         # 10% do bankroll virtual por aposta
     
     # ===== PARÂMETROS DE ESTRATÉGIA =====
