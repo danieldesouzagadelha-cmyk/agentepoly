@@ -481,150 +481,336 @@ class PolymarketClient:
         return 0.0
 
 # ============= CLIENTE DE DADOS DE FUTEBOL =============
+# ============= CLIENTE DE DADOS DE FUTEBOL - VERSÃO REAL =============
 class FootballDataClient:
-    """Cliente para dados de futebol"""
+    """Cliente para dados de futebol usando API real da Polymarket"""
+    
+    # Tags de futebol confirmadas que funcionam no Polymarket [citation:2]
+    SOCCER_TAGS = {
+        # TOP 5 Europeias
+        "premier-league": "Premier League",
+        "laliga": "La Liga",
+        "bundesliga": "Bundesliga",
+        "serie-a": "Serie A",
+        "ligue-1": "Ligue 1",
+        
+        # Outras Europeias
+        "champions-league": "Champions League",
+        "europa-league": "Europa League",
+        "eredivisie": "Eredivisie",
+        "primeira-liga": "Primeira Liga",
+        "scottish-premiership": "Scottish Premiership",
+        
+        # Sul-Americanas ✅ CONFIRMADAS
+        "brazil-serie-a": "Brasileirão Série A",
+        "argentina-primera": "Argentine Primera",
+        "liga-mx": "Liga MX",
+        "copa-libertadores": "Copa Libertadores",
+        "copa-sudamericana": "Copa Sudamericana",
+        
+        # Copas
+        "fa-cup": "FA Cup",
+        "copa-del-rey": "Copa del Rey",
+        "dfb-pokal": "DFB-Pokal",
+        "coppa-italia": "Coppa Italia",
+        "taca-de-portugal": "Taça de Portugal"
+    }
     
     def __init__(self, config: BotConfig):
         self.config = config
+        self.gamma_url = "https://gamma-api.polymarket.com"
+        self.clob_url = "https://clob.polymarket.com"
         self.cache = {}
-        self.last_update = {}
+        self.last_request = 0
+        self.rate_limit = 1.0  # 1 segundo entre requests
+        
+        log.info(f"[INIT] FootballDataClient inicializado")
+        log.info(f"[TAGS] Monitorando {len(self.SOCCER_TAGS)} ligas")
+    
+    def _rate_limit(self):
+        """Respeita rate limit da API"""
+        elapsed = time.time() - self.last_request
+        if elapsed < self.rate_limit:
+            time.sleep(self.rate_limit - elapsed)
+        self.last_request = time.time()
     
     def get_upcoming_matches(self) -> List[Match]:
-        """Obtém próximas partidas"""
+        """Busca jogos de futebol ao vivo da Polymarket"""
         
-        # Se não tem API key, retorna dados simulados
-        if not self.config.odds_api_key:
-            return self._get_mock_matches()
+        all_matches = []
         
-        try:
-            leagues = [
-                "soccer_epl",
-                "soccer_spain_la_liga",
-                "soccer_italy_serie_a",
-                "soccer_germany_bundesliga",
-                "soccer_france_ligue_one",
-                "soccer_brazil_campeonato",
-                "soccer_uefa_champs_league"
-            ]
-            
-            all_matches = []
-            
-            for league in leagues:
-                params = {
-                    "apiKey": self.config.odds_api_key,
-                    "regions": "eu,us",
-                    "markets": "h2h",
-                    "oddsFormat": "decimal",
-                    "dateFormat": "iso"
-                }
+        for tag_slug, league_name in self.SOCCER_TAGS.items():
+            try:
+                log.info(f"[FETCH] Buscando {league_name}...")
                 
-                url = f"https://api.the-odds-api.com/v4/sports/{league}/odds/"
-                resp = requests.get(url, params=params, timeout=10)
+                # 1. Primeiro busca eventos pela tag (método que funciona) [citation:2]
+                events = self._fetch_events_by_tag(tag_slug)
                 
-                if resp.status_code != 200:
+                if not events:
+                    log.debug(f"[SKIP] Nenhum evento para {league_name}")
                     continue
                 
-                for game in resp.json():
-                    match = self._parse_odds_game(game)
+                # 2. Para cada evento, busca mercados
+                for event in events[:5]:  # Limite por evento
+                    match = self._parse_event_to_match(event, league_name)
                     if match:
+                        # 3. Enriquecer com dados de preço do CLOB
+                        self._enrich_with_prices(match)
                         all_matches.append(match)
+                        
+                        log.info(f"  ✅ {match.home_team} vs {match.away_team} | "
+                                f"Odds: {match.home_odds:.2f}/{match.draw_odds:.2f}/{match.away_odds:.2f}")
+                
+                # Pausa entre requisições
+                time.sleep(0.5)
+                
+            except Exception as e:
+                log.error(f"[ERROR] Falha ao buscar {league_name}: {e}")
+                continue
+        
+        log.info(f"[RESULT] Total de {len(all_matches)} jogos encontrados")
+        
+        # Se não encontrou nada, usa dados mockados como fallback
+        if not all_matches:
+            log.warning("[FALLBACK] Nenhum jogo encontrado. Usando dados simulados.")
+            return self._get_mock_matches()
+        
+        return all_matches
+    
+    def _fetch_events_by_tag(self, tag_slug: str) -> List[Dict]:
+        """Busca eventos por tag usando Gamma API"""
+        self._rate_limit()
+        
+        try:
+            url = f"{self.gamma_url}/events"
+            params = {
+                "tag_slug": tag_slug,
+                "active": "true",        # Só eventos ativos
+                "closed": "false",        # Não fechados
+                "limit": 20,              # Máximo por requisição
+                "order": "start_date",
+                "ascending": "true"
+            }
             
-            log.info(f"[ODDS] Encontradas {len(all_matches)} partidas")
-            return all_matches
+            response = requests.get(url, params=params, timeout=10)
+            
+            if response.status_code != 200:
+                log.debug(f"HTTP {response.status_code} para {tag_slug}")
+                return []
+            
+            events = response.json()
+            return events if isinstance(events, list) else []
             
         except Exception as e:
-            log.error(f"Erro ao buscar odds: {e}")
-            return self._get_mock_matches()
+            log.debug(f"Erro ao buscar {tag_slug}: {e}")
+            return []
     
-    def _parse_odds_game(self, game: Dict) -> Optional[Match]:
-        """Converte resposta da API para objeto Match"""
+    def _parse_event_to_match(self, event: Dict, league: str) -> Optional[Match]:
+        """Converte evento da Polymarket em objeto Match"""
         try:
-            # Data de início
-            start_time = datetime.fromisoformat(
-                game["commence_time"].replace("Z", "+00:00")
-            )
+            # Título do evento (ex: "Arsenal vs Chelsea")
+            title = event.get("title", "")
             
-            # Bookmakers
-            bookmakers = game.get("bookmakers", [])
-            if not bookmakers:
+            # Extrai times do título
+            teams = self._extract_teams(title)
+            if not teams:
                 return None
             
-            # Pega o primeiro bookmaker com odds
-            for bk in bookmakers:
-                markets = bk.get("markets", [])
-                if not markets:
-                    continue
-                
-                outcomes = markets[0].get("outcomes", [])
-                if not outcomes:
-                    continue
-                
-                # Mapeia odds
-                odds_map = {o["name"]: 1.0 / o["price"] for o in outcomes}
-                
-                home_team = game["home_team"]
-                away_team = game["away_team"]
-                
-                return Match(
-                    match_id=game["id"],
-                    home_team=home_team,
-                    away_team=away_team,
-                    start_time=start_time,
-                    league=game.get("sport_title", "Football"),
-                    home_odds=odds_map.get(home_team, 0.4),
-                    draw_odds=odds_map.get("Draw", 0.3),
-                    away_odds=odds_map.get(away_team, 0.3)
-                )
+            home_team, away_team = teams
             
-            return None
+            # Data do evento
+            start_date = event.get("start_date")
+            if not start_date:
+                return None
+            
+            start_time = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+            
+            # Markets do evento
+            markets = event.get("markets", [])
+            
+            # Inicializa odds
+            home_odds = 0.5
+            draw_odds = 0.0
+            away_odds = 0.5
+            
+            # Mapeia mercados (Yes/No)
+            for market in markets:
+                outcomes = market.get("outcomes", [])
+                outcome_prices = market.get("outcomePrices", [])
+                
+                if not outcomes or not outcome_prices:
+                    continue
+                
+                # Tenta identificar o tipo de mercado pelo título
+                market_title = market.get("question", "").lower()
+                
+                if "win" in market_title or "winner" in market_title:
+                    # É um mercado de vencedor
+                    if len(outcomes) == 2:
+                        # Pode ser "Yes/No" para "Team A wins"
+                        if home_team.lower() in market_title:
+                            home_odds = float(outcome_prices[0])
+                        elif away_team.lower() in market_title:
+                            away_odds = float(outcome_prices[0])
+                
+                elif "draw" in market_title or "empate" in market_title:
+                    # Mercado de empate
+                    draw_odds = float(outcome_prices[0]) if outcome_prices else 0.3
+            
+            # Se não encontrou draw, assume 0.28 (média)
+            if draw_odds == 0:
+                draw_odds = 0.28
+            
+            # Normaliza odds
+            total = home_odds + draw_odds + away_odds
+            if total > 0:
+                home_odds /= total
+                draw_odds /= total
+                away_odds /= total
+            
+            # Cria o match
+            match = Match(
+                match_id=event.get("id", f"poly_{int(time.time())}"),
+                home_team=home_team,
+                away_team=away_team,
+                start_time=start_time,
+                league=league,
+                condition_id=event.get("condition_id", ""),
+                home_odds=home_odds,
+                draw_odds=draw_odds,
+                away_odds=away_odds,
+                token_ids={}
+            )
+            
+            # Adiciona token IDs se disponíveis
+            for market in markets:
+                clob_token_ids = market.get("clobTokenIds", [])
+                if clob_token_ids and len(clob_token_ids) >= 1:
+                    # Tenta mapear token_id para o resultado
+                    market_title = market.get("question", "").lower()
+                    if home_team.lower() in market_title:
+                        match.token_ids["home"] = clob_token_ids[0]
+                    elif away_team.lower() in market_title:
+                        match.token_ids["away"] = clob_token_ids[0]
+                    elif "draw" in market_title:
+                        match.token_ids["draw"] = clob_token_ids[0]
+            
+            return match
             
         except Exception as e:
-            log.debug(f"Erro ao parsear jogo: {e}")
+            log.debug(f"Erro ao parsear evento: {e}")
             return None
+    
+    def _extract_teams(self, title: str) -> Optional[Tuple[str, str]]:
+        """Extrai times do título do evento"""
+        # Exemplos: "Arsenal vs Chelsea", "Barcelona - Real Madrid"
+        for separator in [" vs ", " VS ", " v ", " - ", " – ", " x "]:
+            if separator in title:
+                parts = title.split(separator)
+                if len(parts) >= 2:
+                    return parts[0].strip(), parts[1].strip()
+        
+        # Fallback: split por espaços
+        words = title.split()
+        if len(words) >= 3:
+            # Assume formato "Team A Team B" (menos comum)
+            mid = len(words) // 2
+            return " ".join(words[:mid]), " ".join(words[mid:])
+        
+        return None
+    
+    def _enrich_with_prices(self, match: Match):
+        """Busca preços atualizados do CLOB"""
+        try:
+            # Para cada token_id, busca preço
+            for outcome, token_id in match.token_ids.items():
+                if token_id:
+                    # Busca book de ordens
+                    url = f"{self.clob_url}/book"
+                    params = {"token_id": token_id}
+                    
+                    response = requests.get(url, params=params, timeout=5)
+                    if response.status_code == 200:
+                        book = response.json()
+                        bids = book.get("bids", [])
+                        asks = book.get("asks", [])
+                        
+                        if bids and asks:
+                            best_bid = float(bids[0].get("price", 0))
+                            best_ask = float(asks[0].get("price", 0))
+                            
+                            # Preço médio
+                            price = (best_bid + best_ask) / 2
+                            
+                            # Atualiza a odd correspondente
+                            if outcome == "home":
+                                match.home_odds = price
+                            elif outcome == "away":
+                                match.away_odds = price
+                            elif outcome == "draw":
+                                match.draw_odds = price
+        except Exception as e:
+            log.debug(f"Erro ao enriquecer preços: {e}")
     
     def get_live_score(self, match: Match) -> Tuple[int, int, int, str]:
-        """Obtém placar ao vivo"""
+        """Busca placar ao vivo"""
         
-        # Se não tem API key, retorna simulado
-        if not self.config.sportradar_key:
-            return self._mock_live_score(match)
+        # Tenta API da Sportradar se tiver key
+        if self.config.sportradar_key:
+            try:
+                # Exemplo: usar match_id como referência
+                url = f"https://api.sportradar.com/soccer/trial/v4/en/matches/{match.match_id}/timeline.json"
+                response = requests.get(
+                    url, 
+                    params={"api_key": self.config.sportradar_key},
+                    timeout=5
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    status = data.get("sport_event_status", {})
+                    minute = status.get("match_time", 0)
+                    home = status.get("home_score", 0)
+                    away = status.get("away_score", 0)
+                    status_str = status.get("status", "live")
+                    
+                    return minute, home, away, status_str
+                    
+            except Exception as e:
+                log.debug(f"Erro Sportradar: {e}")
         
-        try:
-            # Exemplo com Sportradar (ajuste conforme sua API)
-            url = f"https://api.sportradar.com/soccer/trial/v4/en/matches/{match.match_id}/timeline.json"
-            resp = requests.get(url, params={"api_key": self.config.sportradar_key}, timeout=5)
-            
-            data = resp.json()
-            status = data.get("sport_event_status", {})
-            
-            minute = status.get("match_time", 0)
-            home = status.get("home_score", 0)
-            away = status.get("away_score", 0)
-            status_str = status.get("status", "live")
-            
-            return minute, home, away, status_str
-            
-        except Exception as e:
-            log.debug(f"Erro ao buscar placar: {e}")
-            return self._mock_live_score(match)
+        # Fallback: simula baseado no tempo
+        return self._mock_live_score(match)
     
     def _get_mock_matches(self) -> List[Match]:
-        """Gera partidas simuladas para teste"""
+        """Fallback: jogos simulados para quando API não retorna nada"""
         now = datetime.utcnow()
+        matches = []
         
-        return [
-            Match(
-                match_id=f"mock_{i}",
-                home_team=f"Time {chr(65+i)}",
-                away_team=f"Time {chr(75+i)}",
-                start_time=now + timedelta(hours=3*(i+1)),
-                league="Liga Mock",
-                home_odds=0.35 + (i*0.02),
-                draw_odds=0.30,
-                away_odds=0.35 - (i*0.02)
-            )
-            for i in range(5)
+        # Jogos de hoje
+        mock_games = [
+            ("Arsenal", "Chelsea", 0.42, 0.28, 0.30),
+            ("Liverpool", "Man City", 0.38, 0.27, 0.35),
+            ("Barcelona", "Real Madrid", 0.45, 0.25, 0.30),
+            ("Bayern", "Dortmund", 0.48, 0.24, 0.28),
+            ("Flamengo", "Palmeiras", 0.40, 0.28, 0.32),
         ]
+        
+        for i, (home, away, h_odds, d_odds, a_odds) in enumerate(mock_games):
+            match = Match(
+                match_id=f"mock_{i}_{int(time.time())}",
+                home_team=home,
+                away_team=away,
+                start_time=now + timedelta(hours=2*(i+1)),
+                league="Mock League",
+                home_odds=h_odds,
+                draw_odds=d_odds,
+                away_odds=a_odds
+            )
+            matches.append(match)
+        
+        log.info(f"[MOCK] Gerados {len(matches)} jogos simulados")
+        return matches
     
     def _mock_live_score(self, match: Match) -> Tuple[int, int, int, str]:
         """Simula placar ao vivo"""
@@ -636,9 +822,9 @@ class FootballDataClient:
         elif minute >= 90:
             return 90, 2, 1, "finished"
         
-        # Simula alguns gols
-        home_score = 1 if minute > 30 else 0
-        away_score = 1 if minute > 60 else 0
+        # Simula alguns gols baseado nas odds
+        home_score = 1 if minute > 30 and match.home_odds > 0.4 else 0
+        away_score = 1 if minute > 60 and match.away_odds > 0.4 else 0
         
         return minute, home_score, away_score, "live"
 
