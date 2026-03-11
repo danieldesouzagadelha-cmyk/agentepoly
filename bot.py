@@ -270,14 +270,27 @@ class FootballDataClient:
         self.odds_api_key = config.odds_api_key
         self.sportradar_key = config.sportradar_key
 
-    def get_upcoming_matches(self) -> list[Match]:
-        """Get upcoming football matches with odds"""
-        if not self.odds_api_key:
-            log.warning("No ODDS_API_KEY set. Using mock data.")
-            return self._mock_upcoming_matches()
+def get_upcoming_matches(self) -> list[Match]:
+    """Get upcoming football matches with odds"""
 
-        try:
-            url = "https://api.the-odds-api.com/v4/sports/soccer_epl/odds/"
+    if not self.odds_api_key:
+        log.warning("No ODDS_API_KEY set. Using mock data.")
+        return self._mock_upcoming_matches()
+
+    try:
+
+        leagues = [
+            "soccer_epl",
+            "soccer_spain_la_liga",
+            "soccer_italy_serie_a"
+        ]
+
+        matches = []
+
+        for league in leagues:
+
+            url = f"https://api.the-odds-api.com/v4/sports/{league}/odds/"
+
             params = {
                 "apiKey": self.odds_api_key,
                 "regions": "eu",
@@ -285,19 +298,25 @@ class FootballDataClient:
                 "oddsFormat": "decimal",
                 "dateFormat": "iso"
             }
+
             resp = requests.get(url, params=params, timeout=10)
             resp.raise_for_status()
+
             data = resp.json()
-            matches = []
+
             for game in data:
                 match = self._parse_odds_api_game(game)
+
                 if match:
                     matches.append(match)
-            log.info(f"[INFO] Found {len(matches)} upcoming matches")
-            return matches
-        except Exception as e:
-            log.error(f"Error fetching odds: {e}")
-            return self._mock_upcoming_matches()
+
+        log.info(f"[INFO] Found {len(matches)} upcoming matches")
+
+        return matches
+
+    except Exception as e:
+        log.error(f"Error fetching odds: {e}")
+        return self._mock_upcoming_matches()
 
     def _parse_odds_api_game(self, game: dict) -> Optional[Match]:
         try:
